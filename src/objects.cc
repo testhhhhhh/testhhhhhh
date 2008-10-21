@@ -510,6 +510,12 @@ Object* String::Flatten() {
       ASSERT(!ss->buffer()->IsSlicedString());
       Object* ok = String::cast(ss->buffer())->Flatten();
       if (ok->IsFailure()) return ok;
+      // Under certain circumstances (TryFlatten fails in String::Slice)
+      // we can have a cons string under a slice.  In this case we need
+      // to get the flat string out of the cons!
+      if (String::cast(ok)->StringIsConsString()) {
+        ss->set_buffer(ConsString::cast(ok)->first());
+      }
       return this;
     }
     case kConsStringTag: {
@@ -4655,7 +4661,7 @@ Object* JSObject::SetFastElement(uint32_t index, Object* value) {
         JSArray::cast(this)->set_length(Smi::FromInt(index + 1));
       }
     }
-    return this;
+    return value;
   }
 
   // Allow gap in fast case.
@@ -4670,7 +4676,7 @@ Object* JSObject::SetFastElement(uint32_t index, Object* value) {
       SetFastElements(FixedArray::cast(obj));
       if (IsJSArray()) JSArray::cast(this)->set_length(Smi::FromInt(index + 1));
       FixedArray::cast(elements())->set(index, value);
-      return this;
+      return value;
     }
   }
 
