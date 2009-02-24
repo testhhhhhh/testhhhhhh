@@ -122,7 +122,8 @@ namespace v8 { namespace internal {
   V(Code, c_entry_debug_break_code)                     \
   V(FixedArray, number_string_cache)                    \
   V(FixedArray, single_character_string_cache)          \
-  V(FixedArray, natives_source_cache)
+  V(FixedArray, natives_source_cache)                   \
+  V(Object, keyed_lookup_cache)
 
 
 #define ROOT_LIST(V)                                  \
@@ -135,11 +136,13 @@ namespace v8 { namespace internal {
   V(Proto_symbol, "__proto__")                                           \
   V(StringImpl_symbol, "StringImpl")                                     \
   V(arguments_symbol, "arguments")                                       \
+  V(Arguments_symbol, "Arguments")                                       \
   V(arguments_shadow_symbol, ".arguments")                               \
   V(call_symbol, "call")                                                 \
   V(apply_symbol, "apply")                                               \
   V(caller_symbol, "caller")                                             \
   V(boolean_symbol, "boolean")                                           \
+  V(Boolean_symbol, "Boolean")                                           \
   V(callee_symbol, "callee")                                             \
   V(constructor_symbol, "constructor")                                   \
   V(code_symbol, ".code")                                                \
@@ -151,6 +154,8 @@ namespace v8 { namespace internal {
   V(length_symbol, "length")                                             \
   V(name_symbol, "name")                                                 \
   V(number_symbol, "number")                                             \
+  V(Number_symbol, "Number")                                             \
+  V(RegExp_symbol, "RegExp")                                             \
   V(object_symbol, "object")                                             \
   V(prototype_symbol, "prototype")                                       \
   V(string_symbol, "string")                                             \
@@ -244,22 +249,27 @@ class Heap : public AllStatic {
   // Return the starting address and a mask for the new space.  And-masking an
   // address with the mask will result in the start address of the new space
   // for all addresses in either semispace.
-  static Address NewSpaceStart() { return new_space_->start(); }
-  static uint32_t NewSpaceMask() { return new_space_->mask(); }
-  static Address NewSpaceTop() { return new_space_->top(); }
+  static Address NewSpaceStart() { return new_space_.start(); }
+  static uint32_t NewSpaceMask() { return new_space_.mask(); }
+  static Address NewSpaceTop() { return new_space_.top(); }
 
-  static NewSpace* new_space() { return new_space_; }
+  static NewSpace* new_space() { return &new_space_; }
   static OldSpace* old_pointer_space() { return old_pointer_space_; }
   static OldSpace* old_data_space() { return old_data_space_; }
   static OldSpace* code_space() { return code_space_; }
   static MapSpace* map_space() { return map_space_; }
   static LargeObjectSpace* lo_space() { return lo_space_; }
 
+  static bool always_allocate() { return always_allocate_scope_depth_ != 0; }
+  static Address always_allocate_scope_depth_address() {
+    return reinterpret_cast<Address>(&always_allocate_scope_depth_);
+  }
+
   static Address* NewSpaceAllocationTopAddress() {
-    return new_space_->allocation_top_address();
+    return new_space_.allocation_top_address();
   }
   static Address* NewSpaceAllocationLimitAddress() {
-    return new_space_->allocation_limit_address();
+    return new_space_.allocation_limit_address();
   }
 
   // Allocates and initializes a new JavaScript object based on a
@@ -269,6 +279,11 @@ class Heap : public AllStatic {
   // Please note this does not perform a garbage collection.
   static Object* AllocateJSObject(JSFunction* constructor,
                                   PretenureFlag pretenure = NOT_TENURED);
+
+  // Returns a deep copy of the JavaScript object.
+  // Properties and elements are copied too.
+  // Returns failure if allocation failed.
+  static Object* CopyJSObject(JSObject* source);
 
   // Allocates the function prototype.
   // Returns Failure::RetryAfterGC(requested_bytes, space) if the allocation
@@ -375,9 +390,13 @@ class Heap : public AllStatic {
   // Returns Failure::RetryAfterGC(requested_bytes, space) if the allocation
   // failed.
   // Please note this does not perform a garbage collection.
-  static Object* AllocateFixedArray(int length,
-                                    PretenureFlag pretenure = NOT_TENURED);
+  static Object* AllocateFixedArray(int length, PretenureFlag pretenure);
+  // Allocate uninitialized, non-tenured fixed array with length elements.
+  static Object* AllocateFixedArray(int length);
 
+  // Make a copy of src and return it. Returns
+  // Failure::RetryAfterGC(requested_bytes, space) if the allocation failed.
+  static Object* CopyFixedArray(FixedArray* src);
 
   // Allocates a fixed array initialized with the hole values.
   // Returns Failure::RetryAfterGC(requested_bytes, space) if the allocation
@@ -509,7 +528,8 @@ class Heap : public AllStatic {
   // failed.
   // Please note this function does not perform a garbage collection.
   static inline Object* AllocateRaw(int size_in_bytes,
-                                    AllocationSpace space);
+                                    AllocationSpace space,
+                                    AllocationSpace retry_space);
 
   // Makes a new native code object
   // Returns Failure::RetryAfterGC(requested_bytes, space) if the allocation
@@ -556,6 +576,11 @@ class Heap : public AllStatic {
   // Utility to invoke the scavenger. This is needed in test code to
   // ensure correct callback for weak global handles.
   static void PerformScavenge();
+
+#ifdef DEBUG
+  // Utility used with flag gc-greedy.
+  static bool GarbageCollectionGreedyCheck();
+#endif
 
   static void SetGlobalGCPrologueCallback(GCCallback callback) {
     global_gc_prologue_callback_ = callback;
@@ -612,6 +637,7 @@ class Heap : public AllStatic {
 
   // Finds out which space an object should get promoted to based on its type.
   static inline OldSpace* TargetSpace(HeapObject* object);
+  static inline AllocationSpace TargetSpaceId(InstanceType type);
 
   // Sets the stub_cache_ (only used when expanding the dictionary).
   static void set_code_stubs(Dictionary* value) { code_stubs_ = value; }
@@ -620,6 +646,11 @@ class Heap : public AllStatic {
   static void set_non_monomorphic_cache(Dictionary* value) {
     non_monomorphic_cache_ = value;
   }
+
+  // Gets, sets and clears the lookup cache used for keyed access.
+  static inline Object* GetKeyedLookupCache();
+  static inline void SetKeyedLookupCache(LookupCache* cache);
+  static inline void ClearKeyedLookupCache();
 
 #ifdef DEBUG
   static void Print();
@@ -671,7 +702,8 @@ class Heap : public AllStatic {
   // necessary, the object might be promoted to an old space.  The caller must
   // ensure the precondition that the object is (a) a heap object and (b) in
   // the heap's from space.
-  static void CopyObject(HeapObject** p);
+  static void ScavengePointer(HeapObject** p);
+  static inline void ScavengeObject(HeapObject** p, HeapObject* object);
 
   // Clear a range of remembered set addresses corresponding to the object
   // area address 'start' with size 'size_in_bytes', eg, when adding blocks
@@ -716,6 +748,23 @@ class Heap : public AllStatic {
     return amount_of_external_allocated_memory_;
   }
 
+  // Allocate unitialized fixed array (pretenure == NON_TENURE).
+  static Object* AllocateRawFixedArray(int length);
+
+  // True if we have reached the allocation limit in the old generation that
+  // should force the next GC (caused normally) to be a full one.
+  static bool OldGenerationPromotionLimitReached() {
+    return (PromotedSpaceSize() + PromotedExternalMemorySize())
+           > old_gen_promotion_limit_;
+  }
+
+  // True if we have reached the allocation limit in the old generation that
+  // should artificially cause a GC right now.
+  static bool OldGenerationAllocationLimitReached() {
+    return (PromotedSpaceSize() + PromotedExternalMemorySize())
+           > old_gen_allocation_limit_;
+  }
+
  private:
   static int semispace_size_;
   static int initial_semispace_size_;
@@ -725,9 +774,11 @@ class Heap : public AllStatic {
   static int new_space_growth_limit_;
   static int scavenge_count_;
 
+  static int always_allocate_scope_depth_;
+
   static const int kMaxMapSpaceSize = 8*MB;
 
-  static NewSpace* new_space_;
+  static NewSpace new_space_;
   static OldSpace* old_pointer_space_;
   static OldSpace* old_data_space_;
   static OldSpace* code_space_;
@@ -757,8 +808,15 @@ class Heap : public AllStatic {
   static bool disallow_allocation_failure_;
 #endif  // DEBUG
 
-  // Promotion limit that trigger a global GC
-  static int promoted_space_limit_;
+  // Limit that triggers a global GC on the next (normally caused) GC.  This
+  // is checked when we have already decided to do a GC to help determine
+  // which collector to invoke.
+  static int old_gen_promotion_limit_;
+
+  // Limit that triggers a global GC as soon as is reasonable.  This is
+  // checked before expanding a paged space in the old generation and on
+  // every allocation in large object space.
+  static int old_gen_allocation_limit_;
 
   // The amount of external memory registered through the API kept alive
   // by global handles
@@ -810,7 +868,6 @@ class Heap : public AllStatic {
   // (since both AllocateRaw and AllocateRawMap are inlined).
   static inline Object* AllocateRawMap(int size_in_bytes);
 
-
   // Initializes a JSObject based on its map.
   static void InitializeJSObjectFromMap(JSObject* obj,
                                         FixedArray* properties,
@@ -839,7 +896,7 @@ class Heap : public AllStatic {
   // Helper function used by CopyObject to copy a source object to an
   // allocated target object and update the forwarding pointer in the source
   // object.  Returns the target object.
-  static HeapObject* MigrateObject(HeapObject** source_p,
+  static HeapObject* MigrateObject(HeapObject* source,
                                    HeapObject* target,
                                    int size);
 
@@ -866,11 +923,36 @@ class Heap : public AllStatic {
   // Rebuild remembered set in the large object space.
   static void RebuildRSets(LargeObjectSpace* space);
 
+  // Slow part of scavenge object.
+  static void ScavengeObjectSlow(HeapObject** p, HeapObject* object);
+
+  // Copy memory from src to dst.
+  inline static void CopyBlock(Object** dst, Object** src, int byte_size);
+
   static const int kInitialSymbolTableSize = 2048;
   static const int kInitialEvalCacheSize = 64;
 
   friend class Factory;
   friend class DisallowAllocationFailure;
+  friend class AlwaysAllocateScope;
+};
+
+
+class AlwaysAllocateScope {
+ public:
+  AlwaysAllocateScope() {
+    // We shouldn't hit any nested scopes, because that requires
+    // non-handle code to call handle code. The code still works but
+    // performance will degrade, so we want to catch this situation
+    // in debug mode.
+    ASSERT(Heap::always_allocate_scope_depth_ == 0);
+    Heap::always_allocate_scope_depth_++;
+  }
+
+  ~AlwaysAllocateScope() {
+    Heap::always_allocate_scope_depth_--;
+    ASSERT(Heap::always_allocate_scope_depth_ == 0);
+  }
 };
 
 

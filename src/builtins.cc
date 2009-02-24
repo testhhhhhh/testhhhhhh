@@ -177,7 +177,7 @@ BUILTIN(ArrayCode) {
   Object* obj = Heap::AllocateFixedArrayWithHoles(len->value());
   if (obj->IsFailure()) return obj;
   FixedArray* elms = FixedArray::cast(obj);
-  FixedArray::WriteBarrierMode mode = elms->GetWriteBarrierMode();
+  WriteBarrierMode mode = elms->GetWriteBarrierMode();
   // Fill in the content
   for (int index = 0; index < number_of_elements; index++) {
     elms->set(index, BUILTIN_ARG(index+1), mode);
@@ -185,7 +185,7 @@ BUILTIN(ArrayCode) {
 
   // Set length and elements on the array.
   array->set_elements(FixedArray::cast(obj));
-  array->set_length(len);
+  array->set_length(len, SKIP_WRITE_BARRIER);
 
   return array;
 }
@@ -214,7 +214,7 @@ BUILTIN(ArrayPush) {
     Object* obj = Heap::AllocateFixedArrayWithHoles(capacity);
     if (obj->IsFailure()) return obj;
     FixedArray* new_elms = FixedArray::cast(obj);
-    FixedArray::WriteBarrierMode mode = new_elms->GetWriteBarrierMode();
+    WriteBarrierMode mode = new_elms->GetWriteBarrierMode();
     // Fill out the new array with old elements.
     for (int i = 0; i < len; i++) new_elms->set(i, elms->get(i), mode);
     // Add the provided values.
@@ -225,7 +225,7 @@ BUILTIN(ArrayPush) {
     array->set_elements(new_elms);
   }
   // Set the length.
-  array->set_length(Smi::FromInt(new_length));
+  array->set_length(Smi::FromInt(new_length), SKIP_WRITE_BARRIER);
   return array->length();
 }
 BUILTIN_END
@@ -244,12 +244,11 @@ BUILTIN(ArrayPop) {
   Object* top = elms->get(len - 1);
 
   // Set the length.
-  array->set_length(Smi::FromInt(len - 1));
+  array->set_length(Smi::FromInt(len - 1), SKIP_WRITE_BARRIER);
 
   if (!top->IsTheHole()) {
     // Delete the top element.
     elms->set_the_hole(len - 1);
-
     return top;
   }
 
@@ -466,18 +465,8 @@ static void Generate_LoadIC_ArrayLength(MacroAssembler* masm) {
 }
 
 
-static void Generate_LoadIC_ShortStringLength(MacroAssembler* masm) {
-  LoadIC::GenerateShortStringLength(masm);
-}
-
-
-static void Generate_LoadIC_MediumStringLength(MacroAssembler* masm) {
-  LoadIC::GenerateMediumStringLength(masm);
-}
-
-
-static void Generate_LoadIC_LongStringLength(MacroAssembler* masm) {
-  LoadIC::GenerateLongStringLength(masm);
+static void Generate_LoadIC_StringLength(MacroAssembler* masm) {
+  LoadIC::GenerateStringLength(masm);
 }
 
 
@@ -653,13 +642,12 @@ void Builtins::Setup(bool create_heap_objects) {
       CodeDesc desc;
       masm.GetCode(&desc);
       Code::Flags flags =  functions[i].flags;
-      Object* code = Heap::CreateCode(desc, NULL, flags);
-      if (code->IsFailure()) {
-        if (code->IsRetryAfterGC()) {
-          CHECK(Heap::CollectGarbage(Failure::cast(code)->requested(),
-                                     Failure::cast(code)->allocation_space()));
-          code = Heap::CreateCode(desc, NULL, flags);
-        }
+      Object* code;
+      {
+        // During startup it's OK to always allocate and defer GC to later.
+        // This simplifies things because we don't need to retry.
+        AlwaysAllocateScope __scope__;
+        code = Heap::CreateCode(desc, NULL, flags);
         if (code->IsFailure()) {
           v8::internal::V8::FatalProcessOutOfMemory("CreateCode");
         }

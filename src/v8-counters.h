@@ -73,6 +73,8 @@ namespace v8 { namespace internal {
   SC(arguments_adaptors, V8.ArgumentsAdaptors)                   \
   SC(compilation_cache_hits, V8.CompilationCacheHits)            \
   SC(compilation_cache_misses, V8.CompilationCacheMisses)        \
+  SC(regexp_cache_hits, V8.RegExpCacheHits)                      \
+  SC(regexp_cache_misses, V8.RegExpCacheMisses)                  \
   /* Amount of evaled source code. */                            \
   SC(total_eval_size, V8.TotalEvalSize)                          \
   /* Amount of loaded source code. */                            \
@@ -99,6 +101,8 @@ namespace v8 { namespace internal {
      V8.GCCompactorCausedByOldspaceExhaustion)                      \
   SC(gc_compactor_caused_by_weak_handles,                           \
      V8.GCCompactorCausedByWeakHandles)                             \
+  SC(gc_last_resort_from_js, V8.GCLastResortFromJS)                 \
+  SC(gc_last_resort_from_handles, V8.GCLastResortFromHandles)       \
   /* How is the generic keyed-load stub used? */                    \
   SC(keyed_load_generic_smi, V8.KeyedLoadGenericSmi)                \
   SC(keyed_load_generic_symbol, V8.KeyedLoadGenericSymbol)          \

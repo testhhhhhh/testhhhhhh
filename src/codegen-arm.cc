@@ -226,9 +226,7 @@ void CodeGenerator::GenCode(FunctionLiteral* fun) {
     if (FLAG_trace) {
       // Push a valid value as the parameter. The runtime call only uses
       // it as the return value to indicate non-failure.
-      __ mov(r0, Operand(Smi::FromInt(0)));
-      __ push(r0);
-      __ CallRuntime(Runtime::kTraceEnter, 1);
+      __ CallRuntime(Runtime::kTraceEnter, 0);
     }
     CheckStack();
 
@@ -242,11 +240,7 @@ void CodeGenerator::GenCode(FunctionLiteral* fun) {
       bool should_trace =
           is_builtin ? FLAG_trace_builtin_calls : FLAG_trace_calls;
       if (should_trace) {
-        // Push a valid value as the parameter. The runtime call only uses
-        // it as the return value to indicate non-failure.
-        __ mov(r0, Operand(Smi::FromInt(0)));
-        __ push(r0);
-        __ CallRuntime(Runtime::kDebugTrace, 1);
+        __ CallRuntime(Runtime::kDebugTrace, 0);
       }
 #endif
       VisitStatements(body);
@@ -1236,16 +1230,39 @@ int CodeGenerator::FastCaseSwitchMinCaseCount() {
 
 
 void CodeGenerator::GenerateFastCaseSwitchJumpTable(
-    SwitchStatement* node, int min_index, int range, Label *fail_label,
-    SmartPointer<Label*> &case_targets, SmartPointer<Label> &case_labels) {
+    SwitchStatement* node,
+    int min_index,
+    int range,
+    Label* fail_label,
+    Vector<Label*> case_targets,
+    Vector<Label> case_labels) {
 
   ASSERT(kSmiTag == 0 && kSmiTagSize <= 2);
 
   __ pop(r0);
+
+  // Test for a Smi value in a HeapNumber.
+  Label is_smi;
+  __ tst(r0, Operand(kSmiTagMask));
+  __ b(eq, &is_smi);
+  __ ldr(r1, MemOperand(r0, HeapObject::kMapOffset - kHeapObjectTag));
+  __ ldrb(r1, MemOperand(r1, Map::kInstanceTypeOffset - kHeapObjectTag));
+  __ cmp(r1, Operand(HEAP_NUMBER_TYPE));
+  __ b(ne, fail_label);
+  __ push(r0);
+  __ CallRuntime(Runtime::kNumberToSmi, 1);
+  __ bind(&is_smi);
+
   if (min_index != 0) {
-    // small positive numbers can be immediate operands.
+    // Small positive numbers can be immediate operands.
     if (min_index < 0) {
-      __ add(r0, r0, Operand(Smi::FromInt(-min_index)));
+      // If min_index is Smi::kMinValue, -min_index is not a Smi.
+      if (Smi::IsValid(-min_index)) {
+        __ add(r0, r0, Operand(Smi::FromInt(-min_index)));
+      } else {
+        __ add(r0, r0, Operand(Smi::FromInt(-min_index - 1)));
+        __ add(r0, r0, Operand(Smi::FromInt(1)));
+      }
     } else {
       __ sub(r0, r0, Operand(Smi::FromInt(min_index)));
     }
@@ -1259,7 +1276,7 @@ void CodeGenerator::GenerateFastCaseSwitchJumpTable(
   // the pc-register at the above add.
   __ stop("Unreachable: Switch table alignment");
 
-  // table containing branch operations.
+  // Table containing branch operations.
   for (int i = 0; i < range; i++) {
     __ b(case_targets[i]);
   }
@@ -1627,9 +1644,13 @@ void CodeGenerator::VisitTryCatch(TryCatch* node) {
 
   __ PushTryHandler(IN_JAVASCRIPT, TRY_CATCH_HANDLER);
 
-  // Introduce shadow labels for all escapes from the try block,
-  // including returns. We should probably try to unify the escaping
-  // labels and the return label.
+  // Shadow the labels for all escapes from the try block, including
+  // returns. During shadowing, the original label is hidden as the
+  // LabelShadow and operations on the original actually affect the
+  // shadowing label.
+  //
+  // We should probably try to unify the escaping labels and the return
+  // label.
   int nof_escapes = node->escaping_labels()->length();
   List<LabelShadow*> shadows(1 + nof_escapes);
   shadows.Add(new LabelShadow(&function_return_));
@@ -1642,6 +1663,8 @@ void CodeGenerator::VisitTryCatch(TryCatch* node) {
   __ pop(r0);  // Discard the result.
 
   // Stop the introduced shadowing and count the number of required unlinks.
+  // After shadowing stops, the original labels are unshadowed and the
+  // LabelShadows represent the formerly shadowing labels.
   int nof_unlinks = 0;
   for (int i = 0; i <= nof_escapes; i++) {
     shadows[i]->StopShadowing();
@@ -1660,7 +1683,8 @@ void CodeGenerator::VisitTryCatch(TryCatch* node) {
   // Code slot popped.
   if (nof_unlinks > 0) __ b(&exit);
 
-  // Generate unlink code for all used shadow labels.
+  // Generate unlink code for the (formerly) shadowing labels that have been
+  // jumped to.
   for (int i = 0; i <= nof_escapes; i++) {
     if (shadows[i]->is_linked()) {
       // Unlink from try chain;
@@ -1677,7 +1701,7 @@ void CodeGenerator::VisitTryCatch(TryCatch* node) {
       __ add(sp, sp, Operand(StackHandlerConstants::kSize - kPointerSize));
       // Code slot popped.
 
-      __ b(shadows[i]->shadowed());
+      __ b(shadows[i]->original_label());
     }
   }
 
@@ -1708,9 +1732,12 @@ void CodeGenerator::VisitTryFinally(TryFinally* node) {
 
   __ PushTryHandler(IN_JAVASCRIPT, TRY_FINALLY_HANDLER);
 
-  // Introduce shadow labels for all escapes from the try block,
-  // including returns. We should probably try to unify the escaping
-  // labels and the return label.
+  // Shadow the labels for all escapes from the try block, including
+  // returns.  Shadowing hides the original label as the LabelShadow and
+  // operations on the original actually affect the shadowing label.
+  //
+  // We should probably try to unify the escaping labels and the return
+  // label.
   int nof_escapes = node->escaping_labels()->length();
   List<LabelShadow*> shadows(1 + nof_escapes);
   shadows.Add(new LabelShadow(&function_return_));
@@ -1721,8 +1748,9 @@ void CodeGenerator::VisitTryFinally(TryFinally* node) {
   // Generate code for the statements in the try block.
   VisitStatements(node->try_block()->statements());
 
-  // Stop the introduced shadowing and count the number of required
-  // unlinks.
+  // Stop the introduced shadowing and count the number of required unlinks.
+  // After shadowing stops, the original labels are unshadowed and the
+  // LabelShadows represent the formerly shadowing labels.
   int nof_unlinks = 0;
   for (int i = 0; i <= nof_escapes; i++) {
     shadows[i]->StopShadowing();
@@ -1735,14 +1763,17 @@ void CodeGenerator::VisitTryFinally(TryFinally* node) {
   __ mov(r2, Operand(Smi::FromInt(FALLING)));
   if (nof_unlinks > 0) __ b(&unlink);
 
-  // Generate code that sets the state for all used shadow labels.
+  // Generate code to set the state for the (formerly) shadowing labels that
+  // have been jumped to.
   for (int i = 0; i <= nof_escapes; i++) {
     if (shadows[i]->is_linked()) {
       __ bind(shadows[i]);
-      if (shadows[i]->shadowed() == &function_return_) {
-        __ push(r0);  // Materialize the return value on the stack
+      if (shadows[i]->original_label() == &function_return_) {
+        // If this label shadowed the function return, materialize the
+        // return value on the stack.
+        __ push(r0);
       } else {
-        // Fake TOS for break and continue (not return).
+        // Fake TOS for labels that shadowed breaks and continues.
         __ mov(r0, Operand(Factory::undefined_value()));
         __ push(r0);
       }
@@ -1789,18 +1820,18 @@ void CodeGenerator::VisitTryFinally(TryFinally* node) {
   __ pop(r0);
   break_stack_height_ -= kFinallyStackSize;
 
-  // Generate code that jumps to the right destination for all used
-  // shadow labels.
+  // Generate code to jump to the right destination for all used (formerly)
+  // shadowing labels.
   for (int i = 0; i <= nof_escapes; i++) {
     if (shadows[i]->is_bound()) {
       __ cmp(r2, Operand(Smi::FromInt(JUMPING + i)));
-      if (shadows[i]->shadowed() != &function_return_) {
+      if (shadows[i]->original_label() != &function_return_) {
         Label next;
         __ b(ne, &next);
-        __ b(shadows[i]->shadowed());
+        __ b(shadows[i]->original_label());
         __ bind(&next);
       } else {
-        __ b(eq, shadows[i]->shadowed());
+        __ b(eq, shadows[i]->original_label());
       }
     }
   }
@@ -1821,8 +1852,8 @@ void CodeGenerator::VisitTryFinally(TryFinally* node) {
 void CodeGenerator::VisitDebuggerStatement(DebuggerStatement* node) {
   Comment cmnt(masm_, "[ DebuggerStatament");
   if (FLAG_debug_info) RecordStatementPosition(node);
-  __ CallRuntime(Runtime::kDebugBreak, 1);
-  __ push(r0);
+  __ CallRuntime(Runtime::kDebugBreak, 0);
+  // Ignore the return value.
 }
 
 
@@ -3787,7 +3818,8 @@ void CEntryStub::GenerateCore(MacroAssembler* masm,
                               Label* throw_normal_exception,
                               Label* throw_out_of_memory_exception,
                               StackFrame::Type frame_type,
-                              bool do_gc) {
+                              bool do_gc,
+                              bool always_allocate) {
   // r0: result parameter for PerformGC, if any
   // r4: number of arguments including receiver  (C callee-saved)
   // r5: pointer to builtin function  (C callee-saved)
@@ -3796,6 +3828,15 @@ void CEntryStub::GenerateCore(MacroAssembler* masm,
   if (do_gc) {
     // Passing r0.
     __ Call(FUNCTION_ADDR(Runtime::PerformGC), RelocInfo::RUNTIME_ENTRY);
+  }
+
+  ExternalReference scope_depth =
+      ExternalReference::heap_always_allocate_scope_depth();
+  if (always_allocate) {
+    __ mov(r0, Operand(scope_depth));
+    __ ldr(r1, MemOperand(r0));
+    __ add(r1, r1, Operand(1));
+    __ str(r1, MemOperand(r0));
   }
 
   // Call C built-in.
@@ -3818,7 +3859,15 @@ void CEntryStub::GenerateCore(MacroAssembler* masm,
 #else /* !defined(__arm__) */
   __ mov(pc, Operand(r5));
 #endif /* !defined(__arm__) */
-  // result is in r0 or r0:r1 - do not destroy these registers!
+
+  if (always_allocate) {
+    // It's okay to clobber r2 and r3 here. Don't mess with r0 and r1
+    // though (contain the result).
+    __ mov(r2, Operand(scope_depth));
+    __ ldr(r3, MemOperand(r2));
+    __ sub(r3, r3, Operand(1));
+    __ str(r3, MemOperand(r2));
+  }
 
   // check for failure result
   Label failure_returned;
@@ -3895,27 +3944,34 @@ void CEntryStub::GenerateBody(MacroAssembler* masm, bool is_debug_break) {
   Label throw_out_of_memory_exception;
   Label throw_normal_exception;
 
-#ifdef DEBUG
+  // Call into the runtime system. Collect garbage before the call if
+  // running with --gc-greedy set.
   if (FLAG_gc_greedy) {
-    Failure* failure = Failure::RetryAfterGC(0, NEW_SPACE);
+    Failure* failure = Failure::RetryAfterGC(0);
     __ mov(r0, Operand(reinterpret_cast<intptr_t>(failure)));
   }
-  GenerateCore(masm,
-               &throw_normal_exception,
+  GenerateCore(masm, &throw_normal_exception,
                &throw_out_of_memory_exception,
                frame_type,
-               FLAG_gc_greedy);
-#else
-  GenerateCore(masm,
-               &throw_normal_exception,
-               &throw_out_of_memory_exception,
-               frame_type,
+               FLAG_gc_greedy,
                false);
-#endif
+
+  // Do space-specific GC and retry runtime call.
   GenerateCore(masm,
                &throw_normal_exception,
                &throw_out_of_memory_exception,
                frame_type,
+               true,
+               false);
+
+  // Do full GC and retry runtime call one final time.
+  Failure* failure = Failure::InternalError();
+  __ mov(r0, Operand(reinterpret_cast<int32_t>(failure)));
+  GenerateCore(masm,
+               &throw_normal_exception,
+               &throw_out_of_memory_exception,
+               frame_type,
+               true,
                true);
 
   __ bind(&throw_out_of_memory_exception);

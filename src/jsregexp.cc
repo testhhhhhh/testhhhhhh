@@ -30,10 +30,20 @@
 #include "execution.h"
 #include "factory.h"
 #include "jsregexp.h"
-#include "third_party/jscre/pcre.h"
 #include "platform.h"
 #include "runtime.h"
 #include "top.h"
+#include "compilation-cache.h"
+
+// Including pcre.h undefines DEBUG to avoid getting debug output from
+// the JSCRE implementation. Make sure to redefine it in debug mode
+// after having included the header file.
+#ifdef DEBUG
+#include "third_party/jscre/pcre.h"
+#define DEBUG
+#else
+#include "third_party/jscre/pcre.h"
+#endif
 
 namespace v8 { namespace internal {
 
@@ -143,29 +153,59 @@ Handle<String> RegExpImpl::StringToTwoByte(Handle<String> pattern) {
 }
 
 
+static JSRegExp::Flags RegExpFlagsFromString(Handle<String> str) {
+  int flags = JSRegExp::NONE;
+  for (int i = 0; i < str->length(); i++) {
+    switch (str->Get(i)) {
+      case 'i':
+        flags |= JSRegExp::IGNORE_CASE;
+        break;
+      case 'g':
+        flags |= JSRegExp::GLOBAL;
+        break;
+      case 'm':
+        flags |= JSRegExp::MULTILINE;
+        break;
+    }
+  }
+  return JSRegExp::Flags(flags);
+}
+
+
 unibrow::Predicate<unibrow::RegExpSpecialChar, 128> is_reg_exp_special_char;
 
 
 Handle<Object> RegExpImpl::Compile(Handle<JSRegExp> re,
                                    Handle<String> pattern,
-                                   Handle<String> flags) {
-  bool is_atom = true;
-  for (int i = 0; is_atom && i < flags->length(); i++) {
-    if (flags->Get(i) == 'i')
-      is_atom = false;
-  }
-  for (int i = 0; is_atom && i < pattern->length(); i++) {
-    if (is_reg_exp_special_char.get(pattern->Get(i)))
-      is_atom = false;
-  }
+                                   Handle<String> flag_str) {
+  JSRegExp::Flags flags = RegExpFlagsFromString(flag_str);
+  Handle<FixedArray> cached = CompilationCache::LookupRegExp(pattern, flags);
+  bool in_cache = !cached.is_null();
   Handle<Object> result;
-  if (is_atom) {
-    result = AtomCompile(re, pattern);
+  if (in_cache) {
+    re->set_data(*cached);
+    result = re;
   } else {
-    result = JsreCompile(re, pattern, flags);
+    bool is_atom = !flags.is_ignore_case();
+    for (int i = 0; is_atom && i < pattern->length(); i++) {
+      if (is_reg_exp_special_char.get(pattern->Get(i)))
+        is_atom = false;
+    }
+    if (is_atom) {
+      result = AtomCompile(re, pattern, flags);
+    } else {
+      result = JsreCompile(re, pattern, flags);
+    }
+    Object* data = re->data();
+    if (data->IsFixedArray()) {
+      // If compilation succeeded then the data is set on the regexp
+      // and we can store it in the cache.
+      Handle<FixedArray> data(FixedArray::cast(re->data()));
+      CompilationCache::PutRegExp(pattern, flags, data);
+    }
   }
 
-  LOG(RegExpCompileEvent(re));
+  LOG(RegExpCompileEvent(re, in_cache));
   return result;
 }
 
@@ -173,7 +213,7 @@ Handle<Object> RegExpImpl::Compile(Handle<JSRegExp> re,
 Handle<Object> RegExpImpl::Exec(Handle<JSRegExp> regexp,
                                 Handle<String> subject,
                                 Handle<Object> index) {
-  switch (regexp->type_tag()) {
+  switch (regexp->TypeTag()) {
     case JSRegExp::JSCRE:
       return JsreExec(regexp, subject, index);
     case JSRegExp::ATOM:
@@ -187,7 +227,7 @@ Handle<Object> RegExpImpl::Exec(Handle<JSRegExp> regexp,
 
 Handle<Object> RegExpImpl::ExecGlobal(Handle<JSRegExp> regexp,
                                 Handle<String> subject) {
-  switch (regexp->type_tag()) {
+  switch (regexp->TypeTag()) {
     case JSRegExp::JSCRE:
       return JsreExecGlobal(regexp, subject);
     case JSRegExp::ATOM:
@@ -200,9 +240,9 @@ Handle<Object> RegExpImpl::ExecGlobal(Handle<JSRegExp> regexp,
 
 
 Handle<Object> RegExpImpl::AtomCompile(Handle<JSRegExp> re,
-                                       Handle<String> pattern) {
-  re->set_type_tag(JSRegExp::ATOM);
-  re->set_data(*pattern);
+                                       Handle<String> pattern,
+                                       JSRegExp::Flags flags) {
+  Factory::SetRegExpData(re, JSRegExp::ATOM, pattern, flags, pattern);
   return re;
 }
 
@@ -210,7 +250,7 @@ Handle<Object> RegExpImpl::AtomCompile(Handle<JSRegExp> re,
 Handle<Object> RegExpImpl::AtomExec(Handle<JSRegExp> re,
                                     Handle<String> subject,
                                     Handle<Object> index) {
-  Handle<String> needle(String::cast(re->data()));
+  Handle<String> needle(String::cast(re->DataAt(JSRegExp::kAtomPatternIndex)));
 
   uint32_t start_index;
   if (!Array::IndexFromObject(*index, &start_index)) {
@@ -222,15 +262,19 @@ Handle<Object> RegExpImpl::AtomExec(Handle<JSRegExp> re,
   if (value == -1) return Factory::null_value();
 
   Handle<FixedArray> array = Factory::NewFixedArray(2);
-  array->set(0, Smi::FromInt(value));
-  array->set(1, Smi::FromInt(value + needle->length()));
+  array->set(0,
+             Smi::FromInt(value),
+             SKIP_WRITE_BARRIER);
+  array->set(1,
+             Smi::FromInt(value + needle->length()),
+             SKIP_WRITE_BARRIER);
   return Factory::NewJSArrayWithElements(array);
 }
 
 
 Handle<Object> RegExpImpl::AtomExecGlobal(Handle<JSRegExp> re,
                                           Handle<String> subject) {
-  Handle<String> needle(String::cast(re->data()));
+  Handle<String> needle(String::cast(re->DataAt(JSRegExp::kAtomPatternIndex)));
   Handle<JSArray> result = Factory::NewJSArray(1);
   int index = 0;
   int match_count = 0;
@@ -247,8 +291,12 @@ Handle<Object> RegExpImpl::AtomExecGlobal(Handle<JSRegExp> re,
     int end = value + needle_length;
 
     Handle<FixedArray> array = Factory::NewFixedArray(2);
-    array->set(0, Smi::FromInt(value));
-    array->set(1, Smi::FromInt(end));
+    array->set(0,
+               Smi::FromInt(value),
+               SKIP_WRITE_BARRIER);
+    array->set(1,
+               Smi::FromInt(end),
+               SKIP_WRITE_BARRIER);
     Handle<JSArray> pair = Factory::NewJSArrayWithElements(array);
     SetElement(result, match_count, pair);
     match_count++;
@@ -259,17 +307,55 @@ Handle<Object> RegExpImpl::AtomExecGlobal(Handle<JSRegExp> re,
 }
 
 
+static inline Object* DoCompile(String* pattern,
+                                JSRegExp::Flags flags,
+                                unsigned* number_of_captures,
+                                const char** error_message,
+                                JscreRegExp** code) {
+  JSRegExpIgnoreCaseOption case_option = flags.is_ignore_case()
+    ? JSRegExpIgnoreCase
+    : JSRegExpDoNotIgnoreCase;
+  JSRegExpMultilineOption multiline_option = flags.is_multiline()
+    ? JSRegExpMultiline
+    : JSRegExpSingleLine;
+  *error_message = NULL;
+  malloc_failure = Failure::Exception();
+  *code = jsRegExpCompile(pattern->GetTwoByteData(),
+                          pattern->length(),
+                          case_option,
+                          multiline_option,
+                          number_of_captures,
+                          error_message,
+                          &JSREMalloc,
+                          &JSREFree);
+  if (*code == NULL && (malloc_failure->IsRetryAfterGC() ||
+                       malloc_failure->IsOutOfMemoryFailure())) {
+    return malloc_failure;
+  } else {
+    // It doesn't matter which object we return here, we just need to return
+    // a non-failure to indicate to the GC-retry code that there was no
+    // allocation failure.
+    return pattern;
+  }
+}
+
+
+void CompileWithRetryAfterGC(Handle<String> pattern,
+                             JSRegExp::Flags flags,
+                             unsigned* number_of_captures,
+                             const char** error_message,
+                             JscreRegExp** code) {
+  CALL_HEAP_FUNCTION_VOID(DoCompile(*pattern,
+                                    flags,
+                                    number_of_captures,
+                                    error_message,
+                                    code));
+}
+
+
 Handle<Object> RegExpImpl::JsreCompile(Handle<JSRegExp> re,
                                        Handle<String> pattern,
-                                       Handle<String> flags) {
-  JSRegExpIgnoreCaseOption case_option = JSRegExpDoNotIgnoreCase;
-  JSRegExpMultilineOption multiline_option = JSRegExpSingleLine;
-  FlattenString(flags);
-  for (int i = 0; i < flags->length(); i++) {
-    if (flags->Get(i) == 'i') case_option = JSRegExpIgnoreCase;
-    if (flags->Get(i) == 'm') multiline_option = JSRegExpMultiline;
-  }
-
+                                       JSRegExp::Flags flags) {
   Handle<String> two_byte_pattern = StringToTwoByte(pattern);
 
   unsigned number_of_captures;
@@ -278,53 +364,33 @@ Handle<Object> RegExpImpl::JsreCompile(Handle<JSRegExp> re,
   JscreRegExp* code = NULL;
   FlattenString(pattern);
 
-  bool first_time = true;
+  CompileWithRetryAfterGC(two_byte_pattern,
+                          flags,
+                          &number_of_captures,
+                          &error_message,
+                          &code);
 
-  while (true) {
-    malloc_failure = Failure::Exception();
-    code = jsRegExpCompile(two_byte_pattern->GetTwoByteData(),
-                           pattern->length(), case_option,
-                           multiline_option, &number_of_captures,
-                           &error_message, &JSREMalloc, &JSREFree);
-    if (code == NULL) {
-      if (first_time && malloc_failure->IsRetryAfterGC()) {
-        first_time = false;
-        if (!Heap::CollectGarbage(malloc_failure->requested(),
-                                  malloc_failure->allocation_space())) {
-          // TODO(1181417): Fix this.
-          V8::FatalProcessOutOfMemory("RegExpImpl::JsreCompile");
-        }
-        continue;
-      }
-      if (malloc_failure->IsRetryAfterGC() ||
-          malloc_failure->IsOutOfMemoryFailure()) {
-        // TODO(1181417): Fix this.
-        V8::FatalProcessOutOfMemory("RegExpImpl::JsreCompile");
-      } else {
-        // Throw an exception.
-        Handle<JSArray> array = Factory::NewJSArray(2);
-        SetElement(array, 0, pattern);
-        SetElement(array, 1, Factory::NewStringFromUtf8(CStrVector(
-            (error_message == NULL) ? "Unknown regexp error" : error_message)));
-        Handle<Object> regexp_err =
-            Factory::NewSyntaxError("malformed_regexp", array);
-        return Handle<Object>(Top::Throw(*regexp_err));
-      }
-    }
-
-    ASSERT(code != NULL);
-    // Convert the return address to a ByteArray pointer.
-    Handle<ByteArray> internal(
-        ByteArray::FromDataStartAddress(reinterpret_cast<Address>(code)));
-
-    Handle<FixedArray> value = Factory::NewFixedArray(2);
-    value->set(CAPTURE_INDEX, Smi::FromInt(number_of_captures));
-    value->set(INTERNAL_INDEX, *internal);
-    re->set_type_tag(JSRegExp::JSCRE);
-    re->set_data(*value);
-
-    return re;
+  if (code == NULL) {
+    // Throw an exception.
+    Handle<JSArray> array = Factory::NewJSArray(2);
+    SetElement(array, 0, pattern);
+    SetElement(array, 1, Factory::NewStringFromUtf8(CStrVector(
+        (error_message == NULL) ? "Unknown regexp error" : error_message)));
+    Handle<Object> regexp_err =
+        Factory::NewSyntaxError("malformed_regexp", array);
+    return Handle<Object>(Top::Throw(*regexp_err));
   }
+
+  // Convert the return address to a ByteArray pointer.
+  Handle<ByteArray> internal(
+      ByteArray::FromDataStartAddress(reinterpret_cast<Address>(code)));
+
+  Handle<FixedArray> value = Factory::NewFixedArray(2);
+  value->set(CAPTURE_INDEX, Smi::FromInt(number_of_captures));
+  value->set(INTERNAL_INDEX, *internal);
+  Factory::SetRegExpData(re, JSRegExp::JSCRE, pattern, flags, value);
+
+  return re;
 }
 
 
@@ -372,8 +438,12 @@ Handle<Object> RegExpImpl::JsreExecOnce(Handle<JSRegExp> regexp,
   Handle<FixedArray> array = Factory::NewFixedArray(2 * (num_captures+1));
   // The captures come in (start, end+1) pairs.
   for (int i = 0; i < 2 * (num_captures+1); i += 2) {
-    array->set(i, Smi::FromInt(offsets_vector[i]));
-    array->set(i+1, Smi::FromInt(offsets_vector[i+1]));
+    array->set(i,
+               Smi::FromInt(offsets_vector[i]),
+               SKIP_WRITE_BARRIER);
+    array->set(i+1,
+               Smi::FromInt(offsets_vector[i+1]),
+               SKIP_WRITE_BARRIER);
   }
   return Factory::NewJSArrayWithElements(array);
 }
@@ -487,16 +557,14 @@ Handle<Object> RegExpImpl::JsreExecGlobal(Handle<JSRegExp> regexp,
 
 
 int RegExpImpl::JsreCapture(Handle<JSRegExp> re) {
-  Object* value = re->data();
-  ASSERT(value->IsFixedArray());
-  return Smi::cast(FixedArray::cast(value)->get(CAPTURE_INDEX))->value();
+  FixedArray* value = FixedArray::cast(re->DataAt(JSRegExp::kJscreDataIndex));
+  return Smi::cast(value->get(CAPTURE_INDEX))->value();
 }
 
 
 ByteArray* RegExpImpl::JsreInternal(Handle<JSRegExp> re) {
-  Object* value = re->data();
-  ASSERT(value->IsFixedArray());
-  return ByteArray::cast(FixedArray::cast(value)->get(INTERNAL_INDEX));
+  FixedArray* value = FixedArray::cast(re->DataAt(JSRegExp::kJscreDataIndex));
+  return ByteArray::cast(value->get(INTERNAL_INDEX));
 }
 
 }}  // namespace v8::internal

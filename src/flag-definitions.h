@@ -134,6 +134,8 @@ DEFINE_bool(gc_global, false, "always perform global GCs")
 DEFINE_int(gc_interval, -1, "garbage collect after <n> allocations")
 DEFINE_bool(trace_gc, false,
             "print one trace line following each garbage collection")
+DEFINE_bool(collect_maps, false,
+            "garbage collect maps from which no objects can be reached")
 
 // ic.cc
 DEFINE_bool(use_ic, true, "use inline caching")
@@ -159,6 +161,9 @@ DEFINE_bool(h, false, "print this message")
 
 // parser.cc
 DEFINE_bool(allow_natives_syntax, false, "allow natives syntax")
+
+// rewriter.cc
+DEFINE_bool(optimize_ast, true, "optimize the ast")
 
 // simulator-arm.cc
 DEFINE_bool(trace_sim, false, "trace simulator execution")
@@ -191,7 +196,11 @@ DEFINE_string(testing_serialization_file, "/tmp/serdes",
               "file in which to serialize heap")
 #endif
 
+//
+// Dev shell flags
+//
 
+DEFINE_bool(dump_counters, false, "Dump counters on exit")
 
 //
 // Debug only flags
@@ -301,7 +310,6 @@ DEFINE_string(logfile, "v8.log", "Specify the name of the log file.")
 
 // codegen-ia32.cc / codegen-arm.cc
 DEFINE_bool(print_code, false, "print generated code")
-
 
 // Cleanup...
 #undef FLAG_FULL

@@ -54,6 +54,7 @@ class ThreadLocalTop BASE_EMBEDDED {
   bool external_caught_exception_;
   v8::TryCatch* try_catch_handler_;
   SaveContext* save_context_;
+  v8::TryCatch* catcher_;
 
   // Stack.
   Address c_entry_fp_;  // the frame pointer of the top c entry frame
@@ -157,6 +158,12 @@ class Top {
     thread_local_.scheduled_exception_ = Heap::the_hole_value();
   }
 
+  static void setup_external_caught() {
+    thread_local_.external_caught_exception_ =
+        (thread_local_.catcher_ != NULL) &&
+        (Top::thread_local_.try_catch_handler_ == Top::thread_local_.catcher_);
+  }
+
   // Tells whether the current context has experienced an out of memory
   // exception.
   static bool is_out_of_memory();
@@ -219,8 +226,7 @@ class Top {
   static Object* PromoteScheduledException();
   static void DoThrow(Object* exception,
                       MessageLocation* location,
-                      const char* message,
-                      bool is_rethrow);
+                      const char* message);
   static bool ShouldReportException(bool* is_caught_externally);
   static void ReportUncaughtException(Handle<Object> exception,
                                       MessageLocation* location,
@@ -304,6 +310,9 @@ class Top {
 };
 
 
+// If the GCC version is 4.1.x or 4.2.x an additional field is added to the
+// class as a workarround for a bug in the generated code found with these
+// versions of GCC. See V8 issue 122 for details.
 class SaveContext BASE_EMBEDDED {
  public:
   SaveContext() :

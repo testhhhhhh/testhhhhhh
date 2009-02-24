@@ -593,17 +593,21 @@ ExternalReferenceTable::ExternalReferenceTable() : refs_(64) {
       UNCLASSIFIED,
       5,
       "Heap::NewSpaceStart()");
-  Add(ExternalReference::new_space_allocation_limit_address().address(),
+  Add(ExternalReference::heap_always_allocate_scope_depth().address(),
       UNCLASSIFIED,
       6,
+      "Heap::always_allocate_scope_depth()");
+  Add(ExternalReference::new_space_allocation_limit_address().address(),
+      UNCLASSIFIED,
+      7,
       "Heap::NewSpaceAllocationLimitAddress()");
   Add(ExternalReference::new_space_allocation_top_address().address(),
       UNCLASSIFIED,
-      7,
+      8,
       "Heap::NewSpaceAllocationTopAddress()");
   Add(ExternalReference::debug_step_in_fp_address().address(),
       UNCLASSIFIED,
-      8,
+      9,
       "Debug::step_in_fp_addr()");
 }
 
@@ -878,14 +882,14 @@ void Serializer::InitializeAllocators() {
 }
 
 
-bool Serializer::IsVisited(HeapObject *obj) {
+bool Serializer::IsVisited(HeapObject* obj) {
   HashMap::Entry* entry =
     saved_addresses_.Lookup(obj, HeapObjectHash(obj), false);
   return entry != NULL;
 }
 
 
-Address Serializer::GetSavedAddress(HeapObject *obj) {
+Address Serializer::GetSavedAddress(HeapObject* obj) {
   HashMap::Entry* entry
   = saved_addresses_.Lookup(obj, HeapObjectHash(obj), false);
   ASSERT(entry != NULL);
@@ -1413,13 +1417,16 @@ Object* Deserializer::GetObject() {
 
   // Get a raw object of the right size in the right space.
   AllocationSpace space = GetSpace(a);
-  Object *o;
+  Object* o;
   if (IsLargeExecutableObject(a)) {
     o = Heap::lo_space()->AllocateRawCode(size);
   } else if (IsLargeFixedArray(a)) {
     o = Heap::lo_space()->AllocateRawFixedArray(size);
   } else {
-    o = Heap::AllocateRaw(size, space);
+    AllocationSpace retry_space = (space == NEW_SPACE)
+        ? Heap::TargetSpaceId(type)
+        : space;
+    o = Heap::AllocateRaw(size, space, retry_space);
   }
   ASSERT(!o->IsFailure());
   // Check that the simulation of heap allocation was correct.
@@ -1471,7 +1478,7 @@ static inline Object* ResolvePaged(int page_index,
 
 
 template<typename T>
-void ConcatReversed(List<T> * target, const List<T> & source) {
+void ConcatReversed(List<T>* target, const List<T>& source) {
   for (int i = source.length() - 1; i >= 0; i--) {
     target->Add(source[i]);
   }

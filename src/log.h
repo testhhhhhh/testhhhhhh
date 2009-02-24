@@ -109,7 +109,8 @@ class Logger {
 
   // Write a raw string to the log to be used as a preamble.
   // No check is made that the 'preamble' is actually at the beginning
-  // of the log.
+  // of the log. The preample is used to write code events saved in the
+  // snapshot.
   static void Preamble(const char* content);
 
   // ==== Events that are always logged. ====
@@ -181,7 +182,7 @@ class Logger {
   // ==== Events logged by --log-regexp ====
   // Regexp compilation and execution events.
 
-  static void RegExpCompileEvent(Handle<JSRegExp> regexp);
+  static void RegExpCompileEvent(Handle<JSRegExp> regexp, bool in_cache);
 
   static void RegExpExecEvent(Handle<JSRegExp> regexp,
                               int start_index,
@@ -198,6 +199,8 @@ class Logger {
 
   // Emits the source code of a regexp. Used by regexp events.
   static void LogRegExpSource(Handle<JSRegExp> regexp);
+
+  static void LogString(Handle<String> str);
 
   // Emits a profiler tick event. Used by the profiler thread.
   static void TickEvent(TickSample* sample, bool overflow);

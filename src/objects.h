@@ -57,6 +57,9 @@
 //           - HashTable
 //             - Dictionary
 //             - SymbolTable
+//             - CompilationCacheTable
+//             - MapCache
+//             - LookupCache
 //           - Context
 //           - GlobalContext
 //       - String
@@ -161,6 +164,9 @@ class PropertyDetails BASE_EMBEDDED {
  private:
   uint32_t value_;
 };
+
+// Setter that skips the write barrier if mode is SKIP_WRITE_BARRIER.
+enum WriteBarrierMode { SKIP_WRITE_BARRIER, UPDATE_WRITE_BARRIER };
 
 // All Maps have a field instance_type containing a InstanceType.
 // It describes the type of the instances.
@@ -387,29 +393,30 @@ const uint32_t kIsNotStringMask = 0x80;
 const uint32_t kStringTag = 0x0;
 const uint32_t kNotStringTag = 0x80;
 
-// If bit 7 is clear, bits 5 and 6 are the string's size (short, medium, or
-// long).
-const uint32_t kStringSizeMask = 0x60;
-const uint32_t kShortStringTag = 0x0;
-const uint32_t kMediumStringTag = 0x20;
-const uint32_t kLongStringTag = 0x40;
-
-// If bit 7 is clear, bit 4 indicates that the string is a symbol (if set) or
+// If bit 7 is clear, bit 5 indicates that the string is a symbol (if set) or
 // not (if cleared).
-const uint32_t kIsSymbolMask = 0x10;
+const uint32_t kIsSymbolMask = 0x20;
 const uint32_t kNotSymbolTag = 0x0;
-const uint32_t kSymbolTag = 0x10;
+const uint32_t kSymbolTag = 0x20;
 
-// If bit 7 is clear, and the string representation is a sequential string,
-// then bit 3 indicates whether the string consists of two-byte characters or
-// one-byte characters.
-const uint32_t kStringEncodingMask = 0x8;
+// If bit 7 is clear, bits 3 and 4 are the string's size (short, medium or
+// long).  These values are very special in that they are also used to shift
+// the length field to get the length, removing the hash value.  This avoids
+// using if or switch when getting the length of a string.
+const uint32_t kStringSizeMask = 0x18;
+const uint32_t kShortStringTag = 0x18;
+const uint32_t kMediumStringTag = 0x10;
+const uint32_t kLongStringTag = 0x00;
+
+// If bit 7 is clear then bit 2 indicates whether the string consists of
+// two-byte characters or one-byte characters.
+const uint32_t kStringEncodingMask = 0x4;
 const uint32_t kTwoByteStringTag = 0x0;
-const uint32_t kAsciiStringTag = 0x8;
+const uint32_t kAsciiStringTag = 0x4;
 
-// If bit 7 is clear, the low-order 3 bits indicate the representation
+// If bit 7 is clear, the low-order 2 bits indicate the representation
 // of the string.
-const uint32_t kStringRepresentationMask = 0x07;
+const uint32_t kStringRepresentationMask = 0x03;
 enum StringRepresentationTag {
   kSeqStringTag = 0x0,
   kConsStringTag = 0x1,
@@ -526,6 +533,7 @@ enum InstanceType {
   // Pseudo-types
   FIRST_NONSTRING_TYPE = MAP_TYPE,
   FIRST_TYPE = 0x0,
+  INVALID_TYPE = FIRST_TYPE - 1,
   LAST_TYPE = JS_FUNCTION_TYPE,
   // Boundaries for testing the type is a JavaScript "object".  Note that
   // function objects are not counted as objects, even though they are
@@ -549,9 +557,10 @@ enum CompareResult {
   inline void set_##name(bool value);  \
 
 
-#define DECL_ACCESSORS(name, type)  \
-  inline type* name();                 \
-  inline void set_##name(type* value);
+#define DECL_ACCESSORS(name, type)    \
+  inline type* name();                \
+  inline void set_##name(type* value, \
+                         WriteBarrierMode mode = UPDATE_WRITE_BARRIER); \
 
 
 class StringStream;
@@ -614,6 +623,7 @@ class Object BASE_EMBEDDED {
   inline bool IsOddball();
   inline bool IsSharedFunctionInfo();
   inline bool IsJSValue();
+  inline bool IsStringWrapper();
   inline bool IsProxy();
   inline bool IsBoolean();
   inline bool IsJSArray();
@@ -623,6 +633,7 @@ class Object BASE_EMBEDDED {
   inline bool IsSymbolTable();
   inline bool IsCompilationCacheTable();
   inline bool IsMapCache();
+  inline bool IsLookupCache();
   inline bool IsPrimitive();
   inline bool IsGlobalObject();
   inline bool IsJSGlobalObject();
@@ -808,6 +819,7 @@ class Failure: public Object {
   inline bool IsOutOfMemoryException() const;
 
   static Failure* RetryAfterGC(int requested_bytes, AllocationSpace space);
+  static inline Failure* RetryAfterGC(int requested_bytes);  // NEW_SPACE
   static inline Failure* Exception();
   static inline Failure* InternalError();
   static inline Failure* OutOfMemoryException();
@@ -992,10 +1004,6 @@ class HeapObject: public Object {
   // of this struct.
   void IterateStructBody(int object_size, ObjectVisitor* v);
 
-  // Copy the body from the 'from' object to this.
-  // Please note the two object must have the same map prior to the call.
-  inline void CopyBody(JSObject* from);
-
   // Returns the heap object's size in bytes
   inline int Size();
 
@@ -1029,10 +1037,17 @@ class HeapObject: public Object {
   // object is overflowed (ie, partially restore the map pointer).
   inline void ClearOverflow();
 
-  static inline Object* GetHeapObjectField(HeapObject* obj, int index);
+  // Returns the field at offset in obj, as a read/write Object* reference.
+  // Does no checking, and is safe to use during GC, while maps are invalid.
+  // Does not update remembered sets, so should only be assigned to
+  // during marking GC.
+  static inline Object** RawField(HeapObject* obj, int offset);
 
   // Casting.
   static inline HeapObject* cast(Object* obj);
+
+  // Return the write barrier mode for this.
+  inline WriteBarrierMode GetWriteBarrierMode();
 
   // Dispatched behavior.
   void HeapObjectShortPrint(StringStream* accumulator);
@@ -1249,11 +1264,6 @@ class JSObject: public HeapObject {
   inline Object* GetInternalField(int index);
   inline void SetInternalField(int index, Object* value);
 
-  // Returns a deep copy of the JavaScript object.
-  // Properties and elements are copied too.
-  // Returns failure if allocation failed.
-  Object* Copy(PretenureFlag pretenure = NOT_TENURED);
-
   // Lookup a property.  If found, the result is valid and has
   // detailed information.
   void LocalLookup(String* name, LookupResult* result);
@@ -1264,6 +1274,7 @@ class JSObject: public HeapObject {
   void LookupRealNamedProperty(String* name, LookupResult* result);
   void LookupRealNamedPropertyInPrototypes(String* name, LookupResult* result);
   void LookupCallbackSetterInPrototypes(String* name, LookupResult* result);
+  void LookupCallback(String* name, LookupResult* result);
 
   // Returns the number of properties on this object filtering out properties
   // with the specified attributes (ignoring interceptors).
@@ -1353,6 +1364,11 @@ class JSObject: public HeapObject {
   inline Object* FastPropertyAt(int index);
   inline Object* FastPropertyAtPut(int index, Object* value);
 
+  // Access to set in object properties.
+  inline Object* InObjectPropertyAtPut(int index,
+                                       Object* value,
+                                       WriteBarrierMode mode
+                                       = UPDATE_WRITE_BARRIER);
 
   // initializes the body after properties slot, properties slot is
   // initialized by set_properties
@@ -1477,19 +1493,16 @@ class FixedArray: public Array {
   inline Object* get(int index);
   inline void set(int index, Object* value);
 
+  // Setter with barrier mode.
+  inline void set(int index, Object* value, WriteBarrierMode mode);
+
   // Setters for frequently used oddballs located in old space.
   inline void set_undefined(int index);
   inline void set_null(int index);
   inline void set_the_hole(int index);
 
-  // Setter that skips the write barrier if mode is SKIP_WRITE_BARRIER.
-  enum WriteBarrierMode { SKIP_WRITE_BARRIER, UPDATE_WRITE_BARRIER };
-  inline void set(int index, Object* value, WriteBarrierMode mode);
-  // Return the write barrier mode for this.
-  inline WriteBarrierMode GetWriteBarrierMode();
-
   // Copy operations.
-  Object* Copy();
+  inline Object* Copy();
   Object* CopySize(int new_length);
 
   // Add the elements of a JSArray to this FixedArray.
@@ -1590,7 +1603,6 @@ class DescriptorArray: public FixedArray {
   inline void Get(int descriptor_number, Descriptor* desc);
   inline void Set(int descriptor_number, Descriptor* desc);
 
-
   // Copy the descriptor array, insert a new descriptor and optionally
   // remove map transitions.  If the descriptor is already present, it is
   // replaced.  If a replaced descriptor is a real property (not a transition
@@ -1618,6 +1630,10 @@ class DescriptorArray: public FixedArray {
   // with low=0 and high=2.
   int BinarySearch(String* name, int low, int high);
 
+  // Perform a linear search in the instance descriptors represented
+  // by this fixed array.  len is the number of descriptor indeces that are
+  // valid.  Does not require the descriptors to be sorted.
+  int LinearSearch(String* name, int len);
 
   // Allocates a DescriptorArray, but returns the singleton
   // empty descriptor array object if number_of_descriptors is 0.
@@ -1845,19 +1861,6 @@ class SymbolTable: public HashTable<0, 1> {
 };
 
 
-class CompilationCacheTable: public HashTable<0, 2> {
- public:
-  // Find cached value for a string key, otherwise return null.
-  Object* Lookup(String* src);
-  Object* Put(String* src, Object* value);
-
-  static inline CompilationCacheTable* cast(Object* obj);
-
- private:
-  DISALLOW_IMPLICIT_CONSTRUCTORS(CompilationCacheTable);
-};
-
-
 // MapCache.
 //
 // Maps keys that are a fixed array of symbols to a map.
@@ -1871,6 +1874,27 @@ class MapCache: public HashTable<0, 2> {
 
  private:
   DISALLOW_IMPLICIT_CONSTRUCTORS(MapCache);
+};
+
+
+// LookupCache.
+//
+// Maps a key consisting of a map and a name to an index within a
+// fast-case properties array.
+//
+// LookupCaches are used to avoid repeatedly searching instance
+// descriptors.
+class LookupCache: public HashTable<0, 2> {
+ public:
+  int Lookup(Map* map, String* name);
+  Object* Put(Map* map, String* name, int offset);
+  static inline LookupCache* cast(Object* obj);
+
+  // Constant returned by Lookup when the key was not found.
+  static const int kNotFound = -1;
+
+ private:
+  DISALLOW_IMPLICIT_CONSTRUCTORS(LookupCache);
 };
 
 
@@ -1950,9 +1974,6 @@ class Dictionary: public DictionaryBase {
   // Fill in details for properties into storage.
   void CopyKeysTo(FixedArray* storage);
 
-  // Returns the value at entry.
-  static int ValueIndexFor(int entry) { return EntryToIndex(entry)+1; }
-
   // For transforming properties of a JSObject.
   Object* TransformPropertiesToFastFor(JSObject* obj,
                                        int unused_property_fields);
@@ -1970,11 +1991,11 @@ class Dictionary: public DictionaryBase {
 
   // Accessors for next enumeration index.
   void SetNextEnumerationIndex(int index) {
-    fast_set(this, kNextEnumnerationIndexIndex, Smi::FromInt(index));
+    fast_set(this, kNextEnumerationIndexIndex, Smi::FromInt(index));
   }
 
   int NextEnumerationIndex() {
-    return Smi::cast(get(kNextEnumnerationIndexIndex))->value();
+    return Smi::cast(get(kNextEnumerationIndexIndex))->value();
   }
 
   // Returns a new array for dictionary usage. Might return Failure.
@@ -2018,7 +2039,7 @@ class Dictionary: public DictionaryBase {
   Object* GenerateNewEnumerationIndices();
 
   static const int kMaxNumberKeyIndex = kPrefixStartIndex;
-  static const int kNextEnumnerationIndexIndex = kMaxNumberKeyIndex + 1;
+  static const int kNextEnumerationIndexIndex = kMaxNumberKeyIndex + 1;
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(Dictionary);
 };
@@ -2338,13 +2359,8 @@ class Map: public HeapObject {
 
   // Tells whether the instance needs security checks when accessing its
   // properties.
-  inline void set_needs_access_check() {
-    set_bit_field(bit_field() | (1 << kNeedsAccessCheck));
-  }
-
-  inline bool needs_access_check() {
-    return ((1 << kNeedsAccessCheck) & bit_field()) != 0;
-  }
+  inline void set_is_access_check_needed(bool access_check_needed);
+  inline bool is_access_check_needed();
 
   // [prototype]: implicit prototype object.
   DECL_ACCESSORS(prototype, Object)
@@ -2398,6 +2414,17 @@ class Map: public HeapObject {
   // Removes a code object from the code cache at the given index.
   void RemoveFromCodeCache(int index);
 
+  // For every transition in this map, makes the transition's
+  // target's prototype pointer point back to this map.
+  // This is undone in MarkCompactCollector::ClearNonLiveTransitions().
+  void CreateBackPointers();
+
+  // Set all map transitions from this map to dead maps to null.
+  // Also, restore the original prototype on the targets of these
+  // transitions, so that we do not process this map again while
+  // following back pointers.
+  void ClearNonLiveTransitions(Object* real_prototype);
+
   // Dispatched behavior.
   void MapIterateBody(ObjectVisitor* v);
 #ifdef DEBUG
@@ -2435,7 +2462,7 @@ class Map: public HeapObject {
   static const int kHasIndexedInterceptor = 4;
   static const int kIsUndetectable = 5;
   static const int kHasInstanceCallHandler = 6;
-  static const int kNeedsAccessCheck = 7;
+  static const int kIsAccessCheckNeeded = 7;
  private:
   DISALLOW_IMPLICIT_CONSTRUCTORS(Map);
 };
@@ -2718,7 +2745,7 @@ class JSFunction: public JSObject {
 #endif
 
   // Returns the number of allocated literals.
-  int NumberOfLiterals();
+  inline int NumberOfLiterals();
 
   // Retrieve the global context from a function's literal array.
   static Context* GlobalContextFromLiterals(FixedArray* literals);
@@ -2749,8 +2776,11 @@ class GlobalObject: public JSObject {
   // [builtins]: the object holding the runtime routines written in JS.
   DECL_ACCESSORS(builtins, JSBuiltinsObject)
 
-  // [global context]: the global context corresponding to this global objet.
+  // [global context]: the global context corresponding to this global object.
   DECL_ACCESSORS(global_context, Context)
+
+  // Casting.
+  static inline GlobalObject* cast(Object* obj);
 
   // Layout description.
   static const int kBuiltinsOffset = JSObject::kHeaderSize;
@@ -2840,17 +2870,27 @@ class JSValue: public JSObject {
   DISALLOW_IMPLICIT_CONSTRUCTORS(JSValue);
 };
 
-
 // Regular expressions
 class JSRegExp: public JSObject {
  public:
-  enum Type { JSCRE, ATOM };
+  enum Type { NOT_COMPILED, JSCRE, ATOM };
+  enum Flag { NONE = 0, GLOBAL = 1, IGNORE_CASE = 2, MULTILINE = 4 };
 
-  inline Type type_tag();
-  inline void set_type_tag(Type value);
+  class Flags {
+   public:
+    explicit Flags(uint32_t value) : value_(value) { }
+    bool is_global() { return (value_ & GLOBAL) != 0; }
+    bool is_ignore_case() { return (value_ & IGNORE_CASE) != 0; }
+    bool is_multiline() { return (value_ & MULTILINE) != 0; }
+    uint32_t value() { return value_; }
+   private:
+    uint32_t value_;
+  };
 
-  DECL_ACCESSORS(type, Object)
   DECL_ACCESSORS(data, Object)
+
+  inline Type TypeTag();
+  inline Object* DataAt(int index);
 
   static inline JSRegExp* cast(Object* obj);
 
@@ -2860,9 +2900,32 @@ class JSRegExp: public JSObject {
   void JSRegExpVerify();
 #endif
 
-  static const int kTypeOffset = JSObject::kHeaderSize;
-  static const int kDataOffset = kTypeOffset + kIntSize;
+  static const int kDataOffset = JSObject::kHeaderSize;
   static const int kSize = kDataOffset + kIntSize;
+
+  static const int kTagIndex = 0;
+  static const int kSourceIndex = kTagIndex + 1;
+  static const int kFlagsIndex = kSourceIndex + 1;
+  // These two are the same since the same entry is shared for
+  // different purposes in different types of regexps.
+  static const int kAtomPatternIndex = kFlagsIndex + 1;
+  static const int kJscreDataIndex = kFlagsIndex + 1;
+  static const int kDataSize = kAtomPatternIndex + 1;
+};
+
+
+class CompilationCacheTable: public HashTable<0, 2> {
+ public:
+  // Find cached value for a string key, otherwise return null.
+  Object* Lookup(String* src);
+  Object* LookupRegExp(String* source, JSRegExp::Flags flags);
+  Object* Put(String* src, Object* value);
+  Object* PutRegExp(String* src, JSRegExp::Flags flags, FixedArray* value);
+
+  static inline CompilationCacheTable* cast(Object* obj);
+
+ private:
+  DISALLOW_IMPLICIT_CONSTRUCTORS(CompilationCacheTable);
 };
 
 
@@ -2956,6 +3019,10 @@ class String: public HeapObject {
   // Is this string an ascii string.
   inline bool IsAsciiRepresentation();
 
+  // Specialization of this function from Object that skips the
+  // string check.
+  inline bool IsSeqAsciiString();
+
   // Fast testing routines that assume the receiver is a string and
   // just check whether it is a certain kind of string.
   inline bool StringIsSlicedString();
@@ -3039,6 +3106,8 @@ class String: public HeapObject {
 
   // Get the representation tag.
   inline StringRepresentationTag representation_tag();
+  // Get the representation and ASCII tag.
+  inline int full_representation_tag();
   static inline StringRepresentationTag map_representation_tag(Map* map);
 
   // For use during stack traces.  Performs rudimentary sanity check.
@@ -3057,13 +3126,16 @@ class String: public HeapObject {
   static const int kSize = kLengthOffset + kIntSize;
 
   // Limits on sizes of different types of strings.
-  static const int kMaxShortStringSize = 255;
-  static const int kMaxMediumStringSize = 65535;
+  static const int kMaxShortStringSize = 63;
+  static const int kMaxMediumStringSize = 16383;
 
   static const int kMaxArrayIndexSize = 10;
 
   // Max ascii char code.
   static const int kMaxAsciiCharCode = 127;
+
+  // Minimum length for a cons or sliced string.
+  static const int kMinNonFlatLength = 13;
 
   // Mask constant for checking if a string has a computed hash code
   // and if it is an array index.  The least significant bit indicates
@@ -3074,13 +3146,16 @@ class String: public HeapObject {
   static const int kIsArrayIndexMask = 1 << 1;
   static const int kNofLengthBitFields = 2;
 
+  // Array index strings this short can keep their index in the hash
+  // field.
+  static const int kMaxCachedArrayIndexLength = 7;
+
   // Shift constants for retriving length and hash code from
   // length/hash field.
   static const int kHashShift = kNofLengthBitFields;
-  static const int kShortLengthShift = 3 * kBitsPerByte;
-  static const int kMediumLengthShift = 2 * kBitsPerByte;
-  static const int kLongLengthShift = kHashShift;
-
+  static const int kShortLengthShift = kHashShift + kShortStringTag;
+  static const int kMediumLengthShift = kHashShift + kMediumStringTag;
+  static const int kLongLengthShift = kHashShift + kLongStringTag;
 
   // Limit for truncation in short printing.
   static const int kMaxShortPrintLength = 1024;
@@ -3102,11 +3177,11 @@ class String: public HeapObject {
                                         unsigned* offset);
 
   // Helper function for flattening strings.
-  static void Flatten(String* source,
-                      String* sink,
-                      int from,
-                      int to,
-                      int sink_offset);
+  template <typename sinkchar>
+  static void WriteToFlat(String* source,
+                          sinkchar* sink,
+                          int from,
+                          int to);
 
  protected:
   class ReadBlockBuffer {
@@ -3183,6 +3258,8 @@ class SeqAsciiString: public SeqString {
   // Get the address of the characters in this string.
   inline Address GetCharsAddress();
 
+  inline char* GetChars();
+
   // Casting
   static inline SeqAsciiString* cast(Object* obj);
 
@@ -3222,6 +3299,8 @@ class SeqTwoByteString: public SeqString {
 
   // Get the address of the characters in this string.
   inline Address GetCharsAddress();
+
+  inline uc16* GetChars();
 
   // For regexp code.
   const uint16_t* SeqTwoByteStringGetData(unsigned start);
@@ -3264,11 +3343,13 @@ class ConsString: public String {
  public:
   // First object of the cons cell.
   inline Object* first();
-  inline void set_first(Object* first);
+  inline void set_first(Object* first,
+                        WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
   // Second object of the cons cell.
   inline Object* second();
-  inline void set_second(Object* second);
+  inline void set_second(Object* second,
+                         WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
   // Dispatched behavior.
   uint16_t ConsStringGet(int index);
@@ -3294,8 +3375,7 @@ class ConsString: public String {
                                             unsigned* offset_ptr,
                                             unsigned chars);
 
-
-  // Minimum lenth for a cons string.
+  // Minimum length for a cons string.
   static const int kMinLength = 13;
 
  private:
@@ -3341,9 +3421,6 @@ class SlicedString: public String {
   inline void SlicedStringReadBlockIntoBuffer(ReadBlockBuffer* buffer,
                                               unsigned* offset_ptr,
                                               unsigned chars);
-
-  // Minimum lenth for a sliced string.
-  static const int kMinLength = 13;
 
  private:
   DISALLOW_IMPLICIT_CONSTRUCTORS(SlicedString);
@@ -3598,6 +3675,9 @@ class AccessorInfo: public Struct {
   inline bool all_can_write();
   inline void set_all_can_write(bool value);
 
+  inline bool prohibits_overwriting();
+  inline void set_prohibits_overwriting(bool value);
+
   inline PropertyAttributes property_attributes();
   inline void set_property_attributes(PropertyAttributes attributes);
 
@@ -3617,9 +3697,10 @@ class AccessorInfo: public Struct {
 
  private:
   // Bit positions in flag.
-  static const int kAllCanReadBit  = 0;
+  static const int kAllCanReadBit = 0;
   static const int kAllCanWriteBit = 1;
-  class AttributesField: public BitField<PropertyAttributes, 2, 3> {};
+  static const int kProhibitsOverwritingBit = 2;
+  class AttributesField: public BitField<PropertyAttributes, 3, 3> {};
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(AccessorInfo);
 };

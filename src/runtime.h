@@ -64,6 +64,7 @@ namespace v8 { namespace internal {
   \
   /* Array join support */ \
   F(PushIfAbsent, 2) \
+  F(ArrayConcat, 1) \
   \
   /* ConsStrings */ \
   F(ConsStringFst, 1) \
@@ -87,6 +88,7 @@ namespace v8 { namespace internal {
   F(NumberToInteger, 1) \
   F(NumberToJSUint32, 1) \
   F(NumberToJSInt32, 1) \
+  F(NumberToSmi, 1) \
   \
   /* Arithmetic operations */ \
   F(NumberAdd, 2) \
@@ -165,14 +167,21 @@ namespace v8 { namespace internal {
   F(GetScript, 1) \
   \
   F(ClassOf, 1) \
-  F(IsDateClass, 1) \
-  F(IsStringClass, 1) \
-  F(IsArrayClass, 1) \
+  F(HasDateClass, 1) \
+  F(HasStringClass, 1) \
+  F(HasArrayClass, 1) \
+  F(HasFunctionClass, 1) \
+  F(HasNumberClass, 1) \
+  F(HasBooleanClass, 1) \
+  F(HasArgumentsClass, 1) \
+  F(HasRegExpClass, 1) \
   F(SetCode, 2) \
   \
   F(CreateApiFunction, 1) \
   F(IsTemplate, 1) \
   F(GetTemplateField, 2) \
+  F(DisableAccessChecks, 1) \
+  F(EnableAccessChecks, 1) \
   \
   /* Dates */ \
   F(DateCurrentTime, 0) \
@@ -271,10 +280,10 @@ namespace v8 { namespace internal {
   \
   /* Debugging */ \
   F(DebugPrint, 1) \
-  F(DebugTrace, 1) \
-  F(TraceEnter, 1) \
+  F(DebugTrace, 0) \
+  F(TraceEnter, 0) \
   F(TraceExit, 1) \
-  F(DebugBreak, 1) \
+  F(DebugBreak, 0) \
   F(FunctionGetAssemblerCode, 1) \
   F(Abort, 2) \
   \

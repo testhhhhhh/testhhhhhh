@@ -41,7 +41,7 @@ namespace v8 { namespace internal {
 #define __ masm->
 
 
-// Helper function used from LoadIC/CallIC GenerateNormal.
+// Helper function used to load a property from a dictionary backing storage.
 static void GenerateDictionaryLoad(MacroAssembler* masm, Label* miss_label,
                                    Register r0, Register r1, Register r2,
                                    Register name) {
@@ -121,6 +121,29 @@ static void GenerateDictionaryLoad(MacroAssembler* masm, Label* miss_label,
 }
 
 
+// Helper function used to check that a value is either not a function
+// or is loaded if it is a function.
+static void GenerateCheckNonFunctionOrLoaded(MacroAssembler* masm, Label* miss,
+                                             Register value, Register scratch) {
+  Label done;
+  // Check if the value is a Smi.
+  __ test(value, Immediate(kSmiTagMask));
+  __ j(zero, &done, not_taken);
+  // Check if the value is a function.
+  __ mov(scratch, FieldOperand(value, HeapObject::kMapOffset));
+  __ movzx_b(scratch, FieldOperand(scratch, Map::kInstanceTypeOffset));
+  __ cmp(scratch, JS_FUNCTION_TYPE);
+  __ j(not_equal, &done, taken);
+  // Check if the function has been loaded.
+  __ mov(scratch, FieldOperand(value, JSFunction::kSharedFunctionInfoOffset));
+  __ mov(scratch,
+         FieldOperand(scratch, SharedFunctionInfo::kLazyLoadDataOffset));
+  __ cmp(scratch, Factory::undefined_value());
+  __ j(not_equal, miss, not_taken);
+  __ bind(&done);
+}
+
+
 void LoadIC::GenerateArrayLength(MacroAssembler* masm) {
   // ----------- S t a t e -------------
   //  -- ecx    : name
@@ -138,7 +161,7 @@ void LoadIC::GenerateArrayLength(MacroAssembler* masm) {
 }
 
 
-void LoadIC::GenerateShortStringLength(MacroAssembler* masm) {
+void LoadIC::GenerateStringLength(MacroAssembler* masm) {
   // ----------- S t a t e -------------
   //  -- ecx    : name
   //  -- esp[0] : return address
@@ -149,41 +172,7 @@ void LoadIC::GenerateShortStringLength(MacroAssembler* masm) {
 
   __ mov(eax, Operand(esp, kPointerSize));
 
-  StubCompiler::GenerateLoadShortStringLength(masm, eax, edx, &miss);
-  __ bind(&miss);
-  StubCompiler::GenerateLoadMiss(masm, Code::LOAD_IC);
-}
-
-
-void LoadIC::GenerateMediumStringLength(MacroAssembler* masm) {
-  // ----------- S t a t e -------------
-  //  -- ecx    : name
-  //  -- esp[0] : return address
-  //  -- esp[4] : receiver
-  // -----------------------------------
-
-  Label miss;
-
-  __ mov(eax, Operand(esp, kPointerSize));
-
-  StubCompiler::GenerateLoadMediumStringLength(masm, eax, edx, &miss);
-  __ bind(&miss);
-  StubCompiler::GenerateLoadMiss(masm, Code::LOAD_IC);
-}
-
-
-void LoadIC::GenerateLongStringLength(MacroAssembler* masm) {
-  // ----------- S t a t e -------------
-  //  -- ecx    : name
-  //  -- esp[0] : return address
-  //  -- esp[4] : receiver
-  // -----------------------------------
-
-  Label miss;
-
-  __ mov(eax, Operand(esp, kPointerSize));
-
-  StubCompiler::GenerateLoadLongStringLength(masm, eax, edx, &miss);
+  StubCompiler::GenerateLoadStringLength(masm, eax, edx, &miss);
   __ bind(&miss);
   StubCompiler::GenerateLoadMiss(masm, Code::LOAD_IC);
 }
@@ -206,13 +195,25 @@ void LoadIC::GenerateFunctionPrototype(MacroAssembler* masm) {
 }
 
 
+#ifdef DEBUG
+// For use in assert below.
+static int TenToThe(int exponent) {
+  ASSERT(exponent <= 9);
+  ASSERT(exponent >= 1);
+  int answer = 10;
+  for (int i = 1; i < exponent; i++) answer *= 10;
+  return answer;
+}
+#endif
+
+
 void KeyedLoadIC::GenerateGeneric(MacroAssembler* masm) {
   // ----------- S t a t e -------------
   //  -- esp[0] : return address
   //  -- esp[4] : name
   //  -- esp[8] : receiver
   // -----------------------------------
-  Label slow, fast, check_string;
+  Label slow, fast, check_string, index_int, index_string;
 
   __ mov(eax, (Operand(esp, kPointerSize)));
   __ mov(ecx, (Operand(esp, 2 * kPointerSize)));
@@ -234,6 +235,7 @@ void KeyedLoadIC::GenerateGeneric(MacroAssembler* masm) {
   __ j(not_zero, &check_string, not_taken);
   __ sar(eax, kSmiTagSize);
   // Get the elements array of the object.
+  __ bind(&index_int);
   __ mov(ecx, FieldOperand(ecx, JSObject::kElementsOffset));
   // Check that the object is in fast mode (not dictionary).
   __ cmp(FieldOperand(ecx, HeapObject::kMapOffset),
@@ -248,18 +250,34 @@ void KeyedLoadIC::GenerateGeneric(MacroAssembler* masm) {
   KeyedLoadIC::Generate(masm, ExternalReference(Runtime::kKeyedGetProperty));
   // Check if the key is a symbol that is not an array index.
   __ bind(&check_string);
+  __ mov(ebx, FieldOperand(eax, String::kLengthOffset));
+  __ test(ebx, Immediate(String::kIsArrayIndexMask));
+  __ j(not_zero, &index_string, not_taken);
   __ mov(ebx, FieldOperand(eax, HeapObject::kMapOffset));
   __ movzx_b(ebx, FieldOperand(ebx, Map::kInstanceTypeOffset));
   __ test(ebx, Immediate(kIsSymbolMask));
-  __ j(zero, &slow, not_taken);
-  __ mov(ebx, FieldOperand(eax, String::kLengthOffset));
-  __ test(ebx, Immediate(String::kIsArrayIndexMask));
   __ j(not_zero, &slow, not_taken);
   // Probe the dictionary leaving result in ecx.
   GenerateDictionaryLoad(masm, &slow, ebx, ecx, edx, eax);
+  GenerateCheckNonFunctionOrLoaded(masm, &slow, ecx, edx);
   __ mov(eax, Operand(ecx));
   __ IncrementCounter(&Counters::keyed_load_generic_symbol, 1);
   __ ret(0);
+  // Array index string: If short enough use cache in length/hash field (ebx).
+  // We assert that there are enough bits in an int32_t after the hash shift
+  // bits have been subtracted to allow space for the length and the cached
+  // array index.
+  ASSERT(TenToThe(String::kMaxCachedArrayIndexLength) <
+             (1 << (String::kShortLengthShift - String::kHashShift)));
+  __ bind(&index_string);
+  const int kLengthFieldLimit =
+      (String::kMaxCachedArrayIndexLength + 1) << String::kShortLengthShift;
+  __ cmp(ebx, kLengthFieldLimit);
+  __ j(above_equal, &slow);
+  __ mov(eax, Operand(ebx));
+  __ and_(eax, (1 << String::kShortLengthShift) - 1);
+  __ shr(eax, String::kLongLengthShift);
+  __ jmp(&index_int);
   // Fast case: Do the load.
   __ bind(&fast);
   __ mov(eax, Operand(ecx, eax, times_4, Array::kHeaderSize - kHeapObjectTag));
@@ -487,6 +505,12 @@ void CallIC::GenerateNormal(MacroAssembler* masm, int argc) {
   __ cmp(edx, JS_FUNCTION_TYPE);
   __ j(not_equal, &miss, not_taken);
 
+  // Check that the function has been loaded.
+  __ mov(edx, FieldOperand(edi, JSFunction::kSharedFunctionInfoOffset));
+  __ mov(edx, FieldOperand(edx, SharedFunctionInfo::kLazyLoadDataOffset));
+  __ cmp(edx, Factory::undefined_value());
+  __ j(not_equal, &miss, not_taken);
+
   // Invoke the function.
   ParameterCount actual(argc);
   __ InvokeFunction(edi, actual, JUMP_FUNCTION);
@@ -589,6 +613,7 @@ void LoadIC::GenerateNormal(MacroAssembler* masm) {
   // Search the dictionary placing the result in eax.
   __ bind(&probe);
   GenerateDictionaryLoad(masm, &miss, edx, eax, ebx, ecx);
+  GenerateCheckNonFunctionOrLoaded(masm, &miss, eax, edx);
   __ ret(0);
 
   // Global object access: Check access rights.

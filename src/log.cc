@@ -259,7 +259,7 @@ SlidingStateWindow* Logger::sliding_state_window_ = NULL;
 
 void Logger::Preamble(const char* content) {
 #ifdef ENABLE_LOGGING_AND_PROFILING
-  if (logfile_ == NULL || !FLAG_log) return;
+  if (logfile_ == NULL || !FLAG_log_code) return;
   ScopedLock sl(mutex_);
   fprintf(logfile_, "%s", content);
 #endif
@@ -349,6 +349,24 @@ void Logger::SharedLibraryEvent(const wchar_t* library_path,
 
 
 #ifdef ENABLE_LOGGING_AND_PROFILING
+void Logger::LogString(Handle<String> str) {
+  int len = str->length();
+  if (len > 256)
+    len = 256;
+  for (int i = 0; i < len; i++) {
+    uc32 c = str->Get(i);
+    if (c < 32 || (c > 126 && c <= 255)) {
+      fprintf(logfile_, "\\x%02x", c);
+    } else if (c > 255) {
+      fprintf(logfile_, "\\u%04x", c);
+    } else if (c == ',') {
+      fprintf(logfile_, "\\,");
+    } else {
+      fprintf(logfile_, "%lc", c);
+    }
+  }
+}
+
 void Logger::LogRegExpSource(Handle<JSRegExp> regexp) {
   // Prints "/" + re.source + "/" +
   //      (re.global?"g":"") + (re.ignorecase?"i":"") + (re.multiline?"m":"")
@@ -358,29 +376,16 @@ void Logger::LogRegExpSource(Handle<JSRegExp> regexp) {
     fprintf(logfile_, "no source");
     return;
   }
-  Handle<String> source_string = Handle<String>::cast(source);
 
-  SmartPointer<uc16> cstring = source_string->ToWideCString();
-  if (regexp->type()->IsSmi()) {
-    switch (regexp->type_tag()) {
+  switch (regexp->TypeTag()) {
     case JSRegExp::ATOM:
       fprintf(logfile_, "a");
       break;
     default:
       break;
-    }
   }
   fprintf(logfile_, "/");
-  for (int i = 0, n = source_string->length(); i < n; i++) {
-    uc16 c = cstring[i];
-    if (c < 32 || (c > 126 && c <= 255)) {
-      fprintf(logfile_, "\\x%02x", c);
-    } else if (c > 255) {
-      fprintf(logfile_, "\\u%04x", c);
-    } else {
-      fprintf(logfile_, "%lc", c);
-    }
-  }
+  LogString(Handle<String>::cast(source));
   fprintf(logfile_, "/");
 
   // global flag
@@ -402,14 +407,14 @@ void Logger::LogRegExpSource(Handle<JSRegExp> regexp) {
 #endif  // ENABLE_LOGGING_AND_PROFILING
 
 
-void Logger::RegExpCompileEvent(Handle<JSRegExp> regexp) {
+void Logger::RegExpCompileEvent(Handle<JSRegExp> regexp, bool in_cache) {
 #ifdef ENABLE_LOGGING_AND_PROFILING
   if (logfile_ == NULL || !FLAG_log_regexp) return;
   ScopedLock sl(mutex_);
 
   fprintf(logfile_, "regexp-compile,");
   LogRegExpSource(regexp);
-  fprintf(logfile_, "\n");
+  fprintf(logfile_, in_cache ? ",hit\n" : ",miss\n");
 #endif
 }
 
@@ -423,8 +428,9 @@ void Logger::RegExpExecEvent(Handle<JSRegExp> regexp,
 
   fprintf(logfile_, "regexp-run,");
   LogRegExpSource(regexp);
-  fprintf(logfile_, ",0x%08x,%d..%d\n",
-      input_string->Hash(), start_index, input_string->length());
+  fprintf(logfile_, ",");
+  LogString(input_string);
+  fprintf(logfile_, ",%d..%d\n", start_index, input_string->length());
 #endif
 }
 

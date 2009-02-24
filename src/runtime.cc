@@ -94,14 +94,14 @@ static Object* IllegalOperation() {
 
 static Object* Runtime_CloneObjectLiteralBoilerplate(Arguments args) {
   CONVERT_CHECKED(JSObject, boilerplate, args[0]);
-  return boilerplate->Copy();
+  return Heap::CopyJSObject(boilerplate);
 }
 
 
 static Handle<Map> ComputeObjectLiteralMap(
     Handle<Context> context,
     Handle<FixedArray> constant_properties,
-    bool &is_result_from_cache) {
+    bool* is_result_from_cache) {
   if (FLAG_canonicalize_object_literal_maps) {
     // First find prefix of consecutive symbol keys.
     int number_of_properties = constant_properties->length()/2;
@@ -113,18 +113,18 @@ static Handle<Map> ComputeObjectLiteralMap(
     // Based on the number of prefix symbols key we decide whether
     // to use the map cache in the global context.
     const int kMaxKeys = 10;
-    if ((number_of_symbol_keys == number_of_properties)
-        && (number_of_symbol_keys < kMaxKeys)) {
+    if ((number_of_symbol_keys == number_of_properties) &&
+        (number_of_symbol_keys < kMaxKeys)) {
       // Create the fixed array with the key.
       Handle<FixedArray> keys = Factory::NewFixedArray(number_of_symbol_keys);
       for (int i = 0; i < number_of_symbol_keys; i++) {
         keys->set(i, constant_properties->get(i*2));
       }
-      is_result_from_cache = true;
+      *is_result_from_cache = true;
       return Factory::ObjectLiteralMapFromCache(context, keys);
     }
   }
-  is_result_from_cache = false;
+  *is_result_from_cache = false;
   return Handle<Map>(context->object_function()->initial_map());
 }
 
@@ -149,7 +149,7 @@ static Object* Runtime_CreateObjectLiteralBoilerplate(Arguments args) {
   bool is_result_from_cache;
   Handle<Map> map = ComputeObjectLiteralMap(context,
                                             constant_properties,
-                                            is_result_from_cache);
+                                            &is_result_from_cache);
 
   Handle<JSObject> boilerplate = Factory::NewJSObjectFromMap(map);
   {  // Add the constant propeties to the boilerplate.
@@ -221,7 +221,7 @@ static Object* Runtime_ClassOf(Arguments args) {
   return JSObject::cast(obj)->class_name();
 }
 
-inline static Object* IsSpecificClassOf(Arguments args, String* name) {
+inline static Object* HasSpecificClassOf(Arguments args, String* name) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   Object* obj = args[0];
@@ -231,18 +231,43 @@ inline static Object* IsSpecificClassOf(Arguments args, String* name) {
   return Heap::false_value();
 }
 
-static Object* Runtime_IsStringClass(Arguments args) {
-  return IsSpecificClassOf(args, Heap::String_symbol());
+static Object* Runtime_HasStringClass(Arguments args) {
+  return HasSpecificClassOf(args, Heap::String_symbol());
 }
 
 
-static Object* Runtime_IsDateClass(Arguments args) {
-  return IsSpecificClassOf(args, Heap::Date_symbol());
+static Object* Runtime_HasDateClass(Arguments args) {
+  return HasSpecificClassOf(args, Heap::Date_symbol());
 }
 
 
-static Object* Runtime_IsArrayClass(Arguments args) {
-  return IsSpecificClassOf(args, Heap::Array_symbol());
+static Object* Runtime_HasArrayClass(Arguments args) {
+  return HasSpecificClassOf(args, Heap::Array_symbol());
+}
+
+
+static Object* Runtime_HasFunctionClass(Arguments args) {
+  return HasSpecificClassOf(args, Heap::function_class_symbol());
+}
+
+
+static Object* Runtime_HasNumberClass(Arguments args) {
+  return HasSpecificClassOf(args, Heap::Number_symbol());
+}
+
+
+static Object* Runtime_HasBooleanClass(Arguments args) {
+  return HasSpecificClassOf(args, Heap::Boolean_symbol());
+}
+
+
+static Object* Runtime_HasArgumentsClass(Arguments args) {
+  return HasSpecificClassOf(args, Heap::Arguments_symbol());
+}
+
+
+static Object* Runtime_HasRegExpClass(Arguments args) {
+  return HasSpecificClassOf(args, Heap::RegExp_symbol());
 }
 
 
@@ -302,9 +327,52 @@ static Object* Runtime_IsTemplate(Arguments args) {
 static Object* Runtime_GetTemplateField(Arguments args) {
   ASSERT(args.length() == 2);
   CONVERT_CHECKED(HeapObject, templ, args[0]);
-  RUNTIME_ASSERT(templ->IsStruct());
   CONVERT_CHECKED(Smi, field, args[1]);
-  return HeapObject::GetHeapObjectField(templ, field->value());
+  int index = field->value();
+  int offset = index * kPointerSize + HeapObject::kHeaderSize;
+  InstanceType type = templ->map()->instance_type();
+  RUNTIME_ASSERT(type ==  FUNCTION_TEMPLATE_INFO_TYPE ||
+                 type ==  OBJECT_TEMPLATE_INFO_TYPE);
+  RUNTIME_ASSERT(offset > 0);
+  if (type ==  FUNCTION_TEMPLATE_INFO_TYPE) {
+    RUNTIME_ASSERT(offset < FunctionTemplateInfo::kSize);
+  } else {
+    RUNTIME_ASSERT(offset < ObjectTemplateInfo::kSize);
+  }
+  return *HeapObject::RawField(templ, offset);
+}
+
+
+static Object* Runtime_DisableAccessChecks(Arguments args) {
+  ASSERT(args.length() == 1);
+  CONVERT_CHECKED(HeapObject, object, args[0]);
+  Map* old_map = object->map();
+  bool needs_access_checks = old_map->is_access_check_needed();
+  if (needs_access_checks) {
+    // Copy map so it won't interfere constructor's initial map.
+    Object* new_map = old_map->CopyDropTransitions();
+    if (new_map->IsFailure()) return new_map;
+
+    Map::cast(new_map)->set_is_access_check_needed(false);
+    object->set_map(Map::cast(new_map));
+  }
+  return needs_access_checks ? Heap::true_value() : Heap::false_value();
+}
+
+
+static Object* Runtime_EnableAccessChecks(Arguments args) {
+  ASSERT(args.length() == 1);
+  CONVERT_CHECKED(HeapObject, object, args[0]);
+  Map* old_map = object->map();
+  if (!old_map->is_access_check_needed()) {
+    // Copy map so it won't interfere constructor's initial map.
+    Object* new_map = old_map->CopyDropTransitions();
+    if (new_map->IsFailure()) return new_map;
+
+    Map::cast(new_map)->set_is_access_check_needed(true);
+    object->set_map(Map::cast(new_map));
+  }
+  return Heap::undefined_value();
 }
 
 
@@ -449,7 +517,7 @@ static Object* Runtime_DeclareContextSlot(Arguments args) {
   int index;
   PropertyAttributes attributes;
   ContextLookupFlags flags = DONT_FOLLOW_CHAINS;
-  Handle<Object> context_obj =
+  Handle<Object> holder =
       context->Lookup(name, flags, &index, &attributes);
 
   if (attributes != ABSENT) {
@@ -469,14 +537,14 @@ static Object* Runtime_DeclareContextSlot(Arguments args) {
         // The variable or constant context slot should always be in
         // the function context; not in any outer context nor in the
         // arguments object.
-        ASSERT(context_obj.is_identical_to(context));
+        ASSERT(holder.is_identical_to(context));
         if (((attributes & READ_ONLY) == 0) ||
             context->get(index)->IsTheHole()) {
           context->set(index, *initial_value);
         }
       } else {
         // Slow case: The property is not in the FixedArray part of the context.
-        Handle<JSObject> context_ext = Handle<JSObject>::cast(context_obj);
+        Handle<JSObject> context_ext = Handle<JSObject>::cast(holder);
         SetProperty(context_ext, name, initial_value, mode);
       }
     }
@@ -486,7 +554,7 @@ static Object* Runtime_DeclareContextSlot(Arguments args) {
     // "declared" in the function context's extension context, or in the
     // global context.
     Handle<JSObject> context_ext;
-    if (context->extension() != NULL) {
+    if (context->has_extension()) {
       // The function context's extension context exists - use it.
       context_ext = Handle<JSObject>(context->extension());
     } else {
@@ -677,7 +745,7 @@ static Object* Runtime_InitializeConstContextSlot(Arguments args) {
   int index;
   PropertyAttributes attributes;
   ContextLookupFlags flags = DONT_FOLLOW_CHAINS;
-  Handle<Object> context_obj =
+  Handle<Object> holder =
       context->Lookup(name, flags, &index, &attributes);
 
   // The property should always be present. It is always declared
@@ -689,7 +757,7 @@ static Object* Runtime_InitializeConstContextSlot(Arguments args) {
   if (index >= 0) {
     // The constant context slot should always be in the function
     // context; not in any outer context nor in the arguments object.
-    ASSERT(context_obj.is_identical_to(context));
+    ASSERT(holder.is_identical_to(context));
     if (context->get(index)->IsTheHole()) {
       context->set(index, *value);
     }
@@ -697,7 +765,7 @@ static Object* Runtime_InitializeConstContextSlot(Arguments args) {
   }
 
   // Otherwise, the slot must be in a JS object extension.
-  Handle<JSObject> context_ext(JSObject::cast(*context_obj));
+  Handle<JSObject> context_ext(JSObject::cast(*holder));
 
   // We must initialize the value only if it wasn't initialized
   // before, e.g. for const declarations in a loop. The property has
@@ -910,7 +978,7 @@ static Object* Runtime_SetCode(Arguments args) {
       literals->set(JSFunction::kLiteralGlobalContextIndex,
                     context->global_context());
     }
-    target->set_literals(*literals);
+    target->set_literals(*literals, SKIP_WRITE_BARRIER);
   }
 
   target->set_context(*context);
@@ -956,12 +1024,16 @@ static Object* Runtime_CharFromCode(Arguments args) {
 // Cap on the maximal shift in the Boyer-Moore implementation. By setting a
 // limit, we can fix the size of tables.
 static const int kBMMaxShift = 0xff;
-static const int kBMAlphabetSize = 0x100;  // Reduce alphabet to this size.
+// Reduce alphabet to this size.
+static const int kBMAlphabetSize = 0x100;
+// For patterns below this length, the skip length of Boyer-Moore is too short
+// to compensate for the algorithmic overhead compared to simple brute force.
+static const int kBMMinPatternLength = 5;
 
 // Holds the two buffers used by Boyer-Moore string search's Good Suffix
 // shift. Only allows the last kBMMaxShift characters of the needle
 // to be indexed.
-class BMGoodSuffixBuffers: public AllStatic {
+class BMGoodSuffixBuffers {
  public:
   BMGoodSuffixBuffers() {}
   inline void init(int needle_length) {
@@ -985,8 +1057,8 @@ class BMGoodSuffixBuffers: public AllStatic {
  private:
   int suffixes_[kBMMaxShift + 1];
   int good_suffix_shift_[kBMMaxShift + 1];
-  int *biased_suffixes_;
-  int *biased_good_suffix_shift_;
+  int* biased_suffixes_;
+  int* biased_good_suffix_shift_;
   DISALLOW_COPY_AND_ASSIGN(BMGoodSuffixBuffers);
 };
 
@@ -995,27 +1067,33 @@ static int bad_char_occurence[kBMAlphabetSize];
 static BMGoodSuffixBuffers bmgs_buffers;
 
 // Compute the bad-char table for Boyer-Moore in the static buffer.
-// Return false if the pattern contains non-ASCII characters that cannot be
-// in the searched string.
 template <typename pchar>
 static void BoyerMoorePopulateBadCharTable(Vector<const pchar> pattern,
                                           int start) {
   // Run forwards to populate bad_char_table, so that *last* instance
   // of character equivalence class is the one registered.
   // Notice: Doesn't include the last character.
-  for (int i = 0; i < kBMAlphabetSize; i++) {
-    bad_char_occurence[i] = start - 1;
+  int table_size = (sizeof(pchar) == 1) ? String::kMaxAsciiCharCode + 1
+                                        : kBMAlphabetSize;
+  if (start == 0) {  // All patterns less than kBMMaxShift in length.
+    memset(bad_char_occurence, -1, table_size * sizeof(*bad_char_occurence));
+  } else {
+    for (int i = 0; i < table_size; i++) {
+      bad_char_occurence[i] = start - 1;
+    }
   }
-  for (int i = start; i < pattern.length(); i++) {
-    bad_char_occurence[pattern[i] % kBMAlphabetSize] = i;
+  for (int i = start; i < pattern.length() - 1; i++) {
+    pchar c = pattern[i];
+    int bucket = (sizeof(pchar) ==1) ? c : c % kBMAlphabetSize;
+    bad_char_occurence[bucket] = i;
   }
 }
 
 template <typename pchar>
 static void BoyerMoorePopulateGoodSuffixTable(Vector<const pchar> pattern,
-                                              int start,
-                                              int len) {
+                                              int start) {
   int m = pattern.length();
+  int len = m - start;
   // Compute Good Suffix tables.
   bmgs_buffers.init(m);
 
@@ -1061,34 +1139,60 @@ static void BoyerMoorePopulateGoodSuffixTable(Vector<const pchar> pattern,
   }
 }
 
-// Restricted Boyer-Moore string matching. Restricts tables to a
+template <typename schar, typename pchar>
+static inline int CharOccurence(int char_code) {
+  if (sizeof(schar) == 1) {
+    return bad_char_occurence[char_code];
+  }
+  if (sizeof(pchar) == 1) {
+    if (char_code > String::kMaxAsciiCharCode) {
+      return -1;
+    }
+    return bad_char_occurence[char_code];
+  }
+  return bad_char_occurence[char_code % kBMAlphabetSize];
+}
+
+// Restricted simplified Boyer-Moore string matching. Restricts tables to a
 // suffix of long pattern strings and handles only equivalence classes
 // of the full alphabet. This allows us to ensure that tables take only
 // a fixed amount of space.
 template <typename schar, typename pchar>
-static int BoyerMooreIndexOf(Vector<const schar> subject,
-                             Vector<const pchar> pattern,
-                             int start_index) {
-  int m = pattern.length();
+static int BoyerMooreSimplified(Vector<const schar> subject,
+                                Vector<const pchar> pattern,
+                                int start_index,
+                                bool* complete) {
   int n = subject.length();
-
+  int m = pattern.length();
   // Only preprocess at most kBMMaxShift last characters of pattern.
   int start = m < kBMMaxShift ? 0 : m - kBMMaxShift;
-  int len = m - start;
 
   BoyerMoorePopulateBadCharTable(pattern, start);
 
-  int badness = 0;  // How bad we are doing without a good-suffix table.
+  int badness = -m;  // How bad we are doing without a good-suffix table.
   int idx;  // No matches found prior to this index.
+  pchar last_char = pattern[m - 1];
   // Perform search
   for (idx = start_index; idx <= n - m;) {
     int j = m - 1;
-    schar c;
+    int c;
+    while (last_char != (c = subject[idx + j])) {
+      int bc_occ = CharOccurence<schar, pchar>(c);
+      int shift = j - bc_occ;
+      idx += shift;
+      badness += 1 - shift;  // at most zero, so badness cannot increase.
+      if (idx > n - m) {
+        *complete = true;
+        return -1;
+      }
+    }
+    j--;
     while (j >= 0 && pattern[j] == (c = subject[idx + j])) j--;
     if (j < 0) {
+      *complete = true;
       return idx;
     } else {
-      int bc_occ = bad_char_occurence[c % kBMAlphabetSize];
+      int bc_occ = CharOccurence<schar, pchar>(c);
       int shift = bc_occ < j ? j - bc_occ : 1;
       idx += shift;
       // Badness increases by the number of characters we have
@@ -1096,40 +1200,66 @@ static int BoyerMooreIndexOf(Vector<const schar> subject,
       // can skip by shifting. It's a measure of how we are doing
       // compared to reading each character exactly once.
       badness += (m - j) - shift;
-      if (badness > m) break;
+      if (badness > 0) {
+        *complete = false;
+        return idx;
+      }
     }
   }
+  *complete = true;
+  return -1;
+}
 
-  // If we are not done, we got here because we should build the Good Suffix
-  // table and continue searching.
-  if (idx <= n - m) {
-    BoyerMoorePopulateGoodSuffixTable(pattern, start, len);
-    // Continue search from i.
-    do {
-      int j = m - 1;
-      schar c;
-      while (j >= 0 && pattern[j] == (c = subject[idx + j])) j--;
-      if (j < 0) {
-        return idx;
-      } else if (j < start) {
-        // we have matched more than our tables allow us to be smart about.
-        idx += 1;
-      } else {
-        int gs_shift = bmgs_buffers.shift(j + 1);
-        int bc_occ = bad_char_occurence[c % kBMAlphabetSize];
-        int bc_shift = j - bc_occ;
-        idx += (gs_shift > bc_shift) ? gs_shift : bc_shift;
+
+template <typename schar, typename pchar>
+static int BoyerMooreIndexOf(Vector<const schar> subject,
+                             Vector<const pchar> pattern,
+                             int idx) {
+  int n = subject.length();
+  int m = pattern.length();
+  // Only preprocess at most kBMMaxShift last characters of pattern.
+  int start = m < kBMMaxShift ? 0 : m - kBMMaxShift;
+
+  // Build the Good Suffix table and continue searching.
+  BoyerMoorePopulateGoodSuffixTable(pattern, start);
+  pchar last_char = pattern[m - 1];
+  // Continue search from i.
+  do {
+    int j = m - 1;
+    schar c;
+    while (last_char != (c = subject[idx + j])) {
+      int shift = j - CharOccurence<schar, pchar>(c);
+      idx += shift;
+      if (idx > n - m) {
+        return -1;
       }
-    } while (idx <= n - m);
-  }
+    }
+    while (j >= 0 && pattern[j] == (c = subject[idx + j])) j--;
+    if (j < 0) {
+      return idx;
+    } else if (j < start) {
+      // we have matched more than our tables allow us to be smart about.
+      idx += 1;
+    } else {
+      int gs_shift = bmgs_buffers.shift(j + 1);       // Good suffix shift.
+      int bc_occ = CharOccurence<schar, pchar>(c);
+      int shift = j - bc_occ;                         // Bad-char shift.
+      shift = (gs_shift > shift) ? gs_shift : shift;
+      idx += shift;
+    }
+  } while (idx <= n - m);
 
   return -1;
 }
 
-template <typename schar, typename pchar>
+
+template <typename schar>
 static int SingleCharIndexOf(Vector<const schar> string,
-                             pchar pattern_char,
+                             uc16 pattern_char,
                              int start_index) {
+  if (sizeof(schar) == 1 && pattern_char > String::kMaxAsciiCharCode) {
+    return -1;
+  }
   for (int i = start_index, n = string.length(); i < n; i++) {
     if (pattern_char == string[i]) {
       return i;
@@ -1147,20 +1277,22 @@ static int SingleCharIndexOf(Vector<const schar> string,
 template <typename pchar, typename schar>
 static int SimpleIndexOf(Vector<const schar> subject,
                          Vector<const pchar> pattern,
-                         int start_index,
-                         bool &complete) {
-  int pattern_length = pattern.length();
-  int subject_length = subject.length();
-  // Badness is a count of how many extra times the same character
-  // is checked. We compare it to the index counter, so we start
-  // it at the start_index, and give it a little discount to avoid
-  // very early bail-outs.
-  int badness = start_index - pattern_length;
+                         int idx,
+                         bool* complete) {
+  // Badness is a count of how much work we have done.  When we have
+  // done enough work we decide it's probably worth switching to a better
+  // algorithm.
+  int badness = -10 - (pattern.length() << 2);
   // We know our pattern is at least 2 characters, we cache the first so
   // the common case of the first character not matching is faster.
   pchar pattern_first_char = pattern[0];
 
-  for (int i = start_index, n = subject_length - pattern_length; i <= n; i++) {
+  for (int i = idx, n = subject.length() - pattern.length(); i <= n; i++) {
+    badness++;
+    if (badness > 0) {
+      *complete = false;
+      return (i);
+    }
     if (subject[i] != pattern_first_char) continue;
     int j = 1;
     do {
@@ -1168,22 +1300,41 @@ static int SimpleIndexOf(Vector<const schar> subject,
         break;
       }
       j++;
-    } while (j < pattern_length);
-    if (j == pattern_length) {
-      complete = true;
+    } while (j < pattern.length());
+    if (j == pattern.length()) {
+      *complete = true;
       return i;
     }
     badness += j;
-    if (badness > i) {  // More than one extra character on average.
-      complete = false;
-      return (i + 1);  // No matches up to index i+1.
-    }
   }
-  complete = true;
+  *complete = true;
   return -1;
 }
 
-// Dispatch to different algorithms for different length of pattern/subject
+// Simple indexOf that never bails out. For short patterns only.
+template <typename pchar, typename schar>
+static int SimpleIndexOf(Vector<const schar> subject,
+                         Vector<const pchar> pattern,
+                         int idx) {
+  pchar pattern_first_char = pattern[0];
+  for (int i = idx, n = subject.length() - pattern.length(); i <= n; i++) {
+    if (subject[i] != pattern_first_char) continue;
+    int j = 1;
+    do {
+      if (pattern[j] != subject[i+j]) {
+        break;
+      }
+      j++;
+    } while (j < pattern.length());
+    if (j == pattern.length()) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+
+// Dispatch to different algorithms.
 template <typename schar, typename pchar>
 static int StringMatchStrategy(Vector<const schar> sub,
                                Vector<const pchar> pat,
@@ -1201,9 +1352,17 @@ static int StringMatchStrategy(Vector<const schar> sub,
       }
     }
   }
-  // For small searches, a complex sort is not worth the setup overhead.
+  if (pat.length() < kBMMinPatternLength) {
+    // We don't believe fancy searching can ever be more efficient.
+    // The max shift of Boyer-Moore on a pattern of this length does
+    // not compensate for the overhead.
+    return SimpleIndexOf(sub, pat, start_index);
+  }
+  // Try algorithms in order of increasing setup cost and expected performance.
   bool complete;
-  int idx = SimpleIndexOf(sub, pat, start_index, complete);
+  int idx = SimpleIndexOf(sub, pat, start_index, &complete);
+  if (complete) return idx;
+  idx = BoyerMooreSimplified(sub, pat, idx, &complete);
   if (complete) return idx;
   return BoyerMooreIndexOf(sub, pat, idx);
 }
@@ -1265,6 +1424,7 @@ static Object* Runtime_StringIndexOf(Arguments args) {
   uint32_t start_index;
   if (!Array::IndexFromObject(index, &start_index)) return Smi::FromInt(-1);
 
+  RUNTIME_ASSERT(start_index <= static_cast<uint32_t>(sub->length()));
   int position = Runtime::StringMatch(sub, pat, start_index);
   return Smi::FromInt(position);
 }
@@ -1553,23 +1713,56 @@ static Object* Runtime_GetProperty(Arguments args) {
 
 
 
-// KeyedStringGetProperty is called from KeyedLoadIC::GenerateGeneric
+// KeyedStringGetProperty is called from KeyedLoadIC::GenerateGeneric.
 static Object* Runtime_KeyedGetProperty(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
 
-  Object* receiver = args[0];
-  Object* key = args[1];
-  if (receiver->IsJSObject() &&
-      key->IsString() &&
-      !JSObject::cast(receiver)->HasFastProperties()) {
-    Dictionary* dictionary = JSObject::cast(receiver)->property_dictionary();
-    int entry = dictionary->FindStringEntry(String::cast(key));
-    if ((entry != DescriptorArray::kNotFound)
-        && (dictionary->DetailsAt(entry).type() == NORMAL)) {
-      return dictionary->ValueAt(entry);
+  // Fast cases for getting named properties of the receiver JSObject
+  // itself. The global proxy objects has to be excluded since
+  // LocalLookup on the global proxy object can return a valid result
+  // eventhough the global proxy object never has properties.  This is
+  // the case because the global proxy object forwards everything to
+  // its hidden prototype including local lookups.
+  if (args[0]->IsJSObject() &&
+      args[1]->IsString()) {
+    JSObject* receiver = JSObject::cast(args[0]);
+    String* key = String::cast(args[1]);
+    if (receiver->HasFastProperties()) {
+      // Attempt to use lookup cache.
+      Object* obj = Heap::GetKeyedLookupCache();
+      if (obj->IsFailure()) return obj;
+      LookupCache* cache = LookupCache::cast(obj);
+      Map* receiver_map = receiver->map();
+      int offset = cache->Lookup(receiver_map, key);
+      if (offset != LookupCache::kNotFound) {
+        Object* value = receiver->FastPropertyAt(offset);
+        return value->IsTheHole() ? Heap::undefined_value() : value;
+      }
+      // Lookup cache miss.  Perform lookup and update the cache if
+      // appropriate.
+      LookupResult result;
+      receiver->LocalLookup(key, &result);
+      if (result.IsProperty() && result.IsLoaded() && result.type() == FIELD) {
+        int offset = result.GetFieldIndex();
+        Object* obj = cache->Put(receiver_map, key, offset);
+        if (obj->IsFailure()) return obj;
+        Heap::SetKeyedLookupCache(LookupCache::cast(obj));
+        Object* value = receiver->FastPropertyAt(offset);
+        return value->IsTheHole() ? Heap::undefined_value() : value;
+      }
+    } else {
+      // Attempt dictionary lookup.
+      Dictionary* dictionary = receiver->property_dictionary();
+      int entry = dictionary->FindStringEntry(key);
+      if ((entry != DescriptorArray::kNotFound) &&
+          (dictionary->DetailsAt(entry).type() == NORMAL)) {
+        return dictionary->ValueAt(entry);
+      }
     }
   }
+
+  // Fall back to GetObjectProperty.
   return Runtime::GetObjectProperty(args.at<Object>(0),
                                     args.at<Object>(1));
 }
@@ -2385,6 +2578,26 @@ static Object* Runtime_NumberToJSInt32(Arguments args) {
 }
 
 
+// Converts a Number to a Smi, if possible. Returns NaN if the number is not
+// a small integer.
+static Object* Runtime_NumberToSmi(Arguments args) {
+  NoHandleAllocation ha;
+  ASSERT(args.length() == 1);
+
+  Object* obj = args[0];
+  if (obj->IsSmi()) {
+    return obj;
+  }
+  if (obj->IsHeapNumber()) {
+    double value = HeapNumber::cast(obj)->value();
+    int int_value = FastD2I(value);
+    if (value == FastI2D(int_value) && Smi::IsValid(int_value)) {
+      return Smi::FromInt(int_value);
+    }
+  }
+  return Heap::nan_value();
+}
+
 static Object* Runtime_NumberAdd(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
@@ -2475,6 +2688,30 @@ static Object* Runtime_StringAdd(Arguments args) {
 }
 
 
+template<typename sinkchar>
+static inline void StringBuilderConcatHelper(String* special,
+                                             sinkchar* sink,
+                                             FixedArray* fixed_array,
+                                             int array_length) {
+  int position = 0;
+  for (int i = 0; i < array_length; i++) {
+    Object* element = fixed_array->get(i);
+    if (element->IsSmi()) {
+      int len = Smi::cast(element)->value();
+      int pos = len >> 11;
+      len &= 0x7ff;
+      String::WriteToFlat(special, sink + position, pos, pos + len);
+      position += len;
+    } else {
+      String* string = String::cast(element);
+      int element_length = string->length();
+      String::WriteToFlat(string, sink + position, 0, element_length);
+      position += element_length;
+    }
+  }
+}
+
+
 static Object* Runtime_StringBuilderConcat(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
@@ -2531,32 +2768,27 @@ static Object* Runtime_StringBuilderConcat(Arguments args) {
   }
 
   int length = position;
-  position = 0;
   Object* object;
+
   if (ascii) {
     object = Heap::AllocateRawAsciiString(length);
+    if (object->IsFailure()) return object;
+    SeqAsciiString* answer = SeqAsciiString::cast(object);
+    StringBuilderConcatHelper(special,
+                              answer->GetChars(),
+                              fixed_array,
+                              array_length);
+    return answer;
   } else {
     object = Heap::AllocateRawTwoByteString(length);
+    if (object->IsFailure()) return object;
+    SeqTwoByteString* answer = SeqTwoByteString::cast(object);
+    StringBuilderConcatHelper(special,
+                              answer->GetChars(),
+                              fixed_array,
+                              array_length);
+    return answer;
   }
-  if (object->IsFailure()) return object;
-
-  String* answer = String::cast(object);
-  for (int i = 0; i < array_length; i++) {
-    Object* element = fixed_array->get(i);
-    if (element->IsSmi()) {
-      int len = Smi::cast(element)->value();
-      int pos = len >> 11;
-      len &= 0x7ff;
-      String::Flatten(special, answer, pos, pos + len, position);
-      position += len;
-    } else {
-      String* string = String::cast(element);
-      int element_length = string->length();
-      String::Flatten(string, answer, 0, element_length, position);
-      position += element_length;
-    }
-  }
-  return answer;
 }
 
 
@@ -2655,38 +2887,14 @@ static Object* Runtime_StringEquals(Arguments args) {
   CONVERT_CHECKED(String, x, args[0]);
   CONVERT_CHECKED(String, y, args[1]);
 
-  // This is very similar to String::Equals(String*) but that version
-  // requires flattened strings as input, whereas we flatten the
-  // strings only if the fast cases fail.  Note that this may fail,
-  // requiring a GC.  String::Equals(String*) returns a bool and has
-  // no way to signal a failure.
-  if (y == x) return Smi::FromInt(EQUAL);
-  if (x->IsSymbol() && y->IsSymbol()) return Smi::FromInt(NOT_EQUAL);
-  // Compare contents
-  int len = x->length();
-  if (len != y->length()) return Smi::FromInt(NOT_EQUAL);
-  if (len == 0) return Smi::FromInt(EQUAL);
-
-  // Handle one elment strings.
-  if (x->Get(0) != y->Get(0)) return Smi::FromInt(NOT_EQUAL);
-  if (len == 1) return Smi::FromInt(EQUAL);
-
-  // Fast case:  First, middle and last characters.
-  if (x->Get(len>>1) != y->Get(len>>1)) return Smi::FromInt(NOT_EQUAL);
-  if (x->Get(len - 1) != y->Get(len - 1)) return Smi::FromInt(NOT_EQUAL);
-
-  x->TryFlatten();
-  y->TryFlatten();
-
-  static StringInputBuffer buf1;
-  static StringInputBuffer buf2;
-  buf1.Reset(x);
-  buf2.Reset(y);
-  while (buf1.has_more()) {
-    if (buf1.GetNext() != buf2.GetNext())
-      return Smi::FromInt(NOT_EQUAL);
-  }
-  return Smi::FromInt(EQUAL);
+  bool not_equal = !x->Equals(y);
+  // This is slightly convoluted because the value that signifies
+  // equality is 0 and inequality is 1 so we have to negate the result
+  // from String::Equals.
+  ASSERT(not_equal == 0 || not_equal == 1);
+  STATIC_CHECK(EQUAL == 0);
+  STATIC_CHECK(NOT_EQUAL == 1);
+  return Smi::FromInt(not_equal);
 }
 
 
@@ -2996,10 +3204,16 @@ static Object* Runtime_NewArguments(Arguments args) {
   const int length = frame->GetProvidedParametersCount();
   Object* result = Heap::AllocateArgumentsObject(callee, length);
   if (result->IsFailure()) return result;
-  FixedArray* array = FixedArray::cast(JSObject::cast(result)->elements());
-  ASSERT(array->length() == length);
-  for (int i = 0; i < length; i++) {
-    array->set(i, frame->GetParameter(i));
+  if (length > 0) {
+    Object* obj =  Heap::AllocateFixedArray(length);
+    if (obj->IsFailure()) return obj;
+    FixedArray* array = FixedArray::cast(obj);
+    ASSERT(array->length() == length);
+    WriteBarrierMode mode = array->GetWriteBarrierMode();
+    for (int i = 0; i < length; i++) {
+      array->set(i, frame->GetParameter(i), mode);
+    }
+    JSObject::cast(result)->set_elements(array);
   }
   return result;
 }
@@ -3015,11 +3229,22 @@ static Object* Runtime_NewArgumentsFast(Arguments args) {
 
   Object* result = Heap::AllocateArgumentsObject(callee, length);
   if (result->IsFailure()) return result;
-  FixedArray* array = FixedArray::cast(JSObject::cast(result)->elements());
-  ASSERT(array->length() == length);
-  FixedArray::WriteBarrierMode mode = array->GetWriteBarrierMode();
-  for (int i = 0; i < length; i++) {
-    array->set(i, *--parameters, mode);
+  ASSERT(Heap::InNewSpace(result));
+
+  // Allocate the elements if needed.
+  if (length > 0) {
+    // Allocate the fixed array.
+    Object* obj = Heap::AllocateRawFixedArray(length);
+    if (obj->IsFailure()) return obj;
+    reinterpret_cast<Array*>(obj)->set_map(Heap::fixed_array_map());
+    FixedArray* array = FixedArray::cast(obj);
+    array->set_length(length);
+    WriteBarrierMode mode = array->GetWriteBarrierMode();
+    for (int i = 0; i < length; i++) {
+      array->set(i, *--parameters, mode);
+    }
+    JSObject::cast(result)->set_elements(FixedArray::cast(obj),
+                                         SKIP_WRITE_BARRIER);
   }
   return result;
 }
@@ -3189,12 +3414,12 @@ static Object* Runtime_LookupContext(Arguments args) {
   int index;
   PropertyAttributes attributes;
   ContextLookupFlags flags = FOLLOW_CHAINS;
-  Handle<Object> context_obj =
+  Handle<Object> holder =
       context->Lookup(name, flags, &index, &attributes);
 
-  if (index < 0 && *context_obj != NULL) {
-    ASSERT(context_obj->IsJSObject());
-    return *context_obj;
+  if (index < 0 && !holder.is_null()) {
+    ASSERT(holder->IsJSObject());
+    return *holder;
   }
 
   // No intermediate context found. Use global object by default.
@@ -3209,59 +3434,80 @@ static Object* Runtime_LookupContext(Arguments args) {
 // compiler to do the right thing.
 //
 // TODO(1236026): This is a non-portable hack that should be removed.
-typedef uint64_t ObjPair;
-ObjPair MakePair(Object* x, Object* y) {
+typedef uint64_t ObjectPair;
+static inline ObjectPair MakePair(Object* x, Object* y) {
   return reinterpret_cast<uint32_t>(x) |
-         (reinterpret_cast<ObjPair>(y) << 32);
+      (reinterpret_cast<ObjectPair>(y) << 32);
 }
 
 
-static Object* Unhole(Object* x, PropertyAttributes attributes) {
+static inline Object* Unhole(Object* x, PropertyAttributes attributes) {
   ASSERT(!x->IsTheHole() || (attributes & READ_ONLY) != 0);
   USE(attributes);
   return x->IsTheHole() ? Heap::undefined_value() : x;
 }
 
 
-static ObjPair LoadContextSlotHelper(Arguments args, bool throw_error) {
+static JSObject* ComputeReceiverForNonGlobal(JSObject* holder) {
+  ASSERT(!holder->IsGlobalObject());
+  Context* top = Top::context();
+  // Get the context extension function.
+  JSFunction* context_extension_function =
+      top->global_context()->context_extension_function();
+  // If the holder isn't a context extension object, we just return it
+  // as the receiver. This allows arguments objects to be used as
+  // receivers, but only if they are put in the context scope chain
+  // explicitly via a with-statement.
+  Object* constructor = holder->map()->constructor();
+  if (constructor != context_extension_function) return holder;
+  // Fall back to using the global object as the receiver if the
+  // property turns out to be a local variable allocated in a context
+  // extension object - introduced via eval.
+  return top->global();
+}
+
+
+static ObjectPair LoadContextSlotHelper(Arguments args, bool throw_error) {
   HandleScope scope;
   ASSERT(args.length() == 2);
 
-  if (!args[0]->IsContext()) return MakePair(IllegalOperation(), NULL);
+  if (!args[0]->IsContext() || !args[1]->IsString()) {
+    return MakePair(IllegalOperation(), NULL);
+  }
   Handle<Context> context = args.at<Context>(0);
-  Handle<String> name(String::cast(args[1]));
+  Handle<String> name = args.at<String>(1);
 
   int index;
   PropertyAttributes attributes;
   ContextLookupFlags flags = FOLLOW_CHAINS;
-  Handle<Object> context_obj =
+  Handle<Object> holder =
       context->Lookup(name, flags, &index, &attributes);
 
+  // If the index is non-negative, the slot has been found in a local
+  // variable or a parameter. Read it from the context object or the
+  // arguments object.
   if (index >= 0) {
-    if (context_obj->IsContext()) {
-      // The context is an Execution context, and the "property" we were looking
-      // for is a local variable in that context. According to ECMA-262, 3rd.,
-      // 10.1.6 and 10.2.3, the receiver is the global object.
-      return MakePair(
-          Unhole(Handle<Context>::cast(context_obj)->get(index), attributes),
-          Top::context()->global());
-    } else {
-      return MakePair(
-          Unhole(Handle<JSObject>::cast(context_obj)->GetElement(index),
-                 attributes),
-          *context_obj);
-    }
+    // If the "property" we were looking for is a local variable or an
+    // argument in a context, the receiver is the global object; see
+    // ECMA-262, 3rd., 10.1.6 and 10.2.3.
+    JSObject* receiver = Top::context()->global();
+    Object* value = (holder->IsContext())
+        ? Context::cast(*holder)->get(index)
+        : JSObject::cast(*holder)->GetElement(index);
+    return MakePair(Unhole(value, attributes), receiver);
   }
 
-  if (*context_obj != NULL) {
-    ASSERT(Handle<JSObject>::cast(context_obj)->HasProperty(*name));
-    // Note: As of 5/29/2008, GetProperty does the "unholing" and so this call
-    // here is redundant. We left it anyway, to be explicit; also it's not clear
-    // why GetProperty should do the unholing in the first place.
-    return MakePair(
-        Unhole(Handle<JSObject>::cast(context_obj)->GetProperty(*name),
-               attributes),
-        *context_obj);
+  // If the holder is found, we read the property from it.
+  if (!holder.is_null() && holder->IsJSObject()) {
+    ASSERT(Handle<JSObject>::cast(holder)->HasProperty(*name));
+    JSObject* object = JSObject::cast(*holder);
+    JSObject* receiver = (object->IsGlobalObject())
+        ? GlobalObject::cast(object)
+        : ComputeReceiverForNonGlobal(object);
+    // No need to unhole the value here. This is taken care of by the
+    // GetProperty function.
+    Object* value = object->GetProperty(*name);
+    return MakePair(value, receiver);
   }
 
   if (throw_error) {
@@ -3276,12 +3522,12 @@ static ObjPair LoadContextSlotHelper(Arguments args, bool throw_error) {
 }
 
 
-static ObjPair Runtime_LoadContextSlot(Arguments args) {
+static ObjectPair Runtime_LoadContextSlot(Arguments args) {
   return LoadContextSlotHelper(args, true);
 }
 
 
-static ObjPair Runtime_LoadContextSlotNoReferenceError(Arguments args) {
+static ObjectPair Runtime_LoadContextSlotNoReferenceError(Arguments args) {
   return LoadContextSlotHelper(args, false);
 }
 
@@ -3297,19 +3543,19 @@ static Object* Runtime_StoreContextSlot(Arguments args) {
   int index;
   PropertyAttributes attributes;
   ContextLookupFlags flags = FOLLOW_CHAINS;
-  Handle<Object> context_obj =
+  Handle<Object> holder =
       context->Lookup(name, flags, &index, &attributes);
 
   if (index >= 0) {
-    if (context_obj->IsContext()) {
+    if (holder->IsContext()) {
       // Ignore if read_only variable.
       if ((attributes & READ_ONLY) == 0) {
-        Handle<Context>::cast(context_obj)->set(index, *value);
+        Handle<Context>::cast(holder)->set(index, *value);
       }
     } else {
       ASSERT((attributes & READ_ONLY) == 0);
       Object* result =
-          Handle<JSObject>::cast(context_obj)->SetElement(index, *value);
+          Handle<JSObject>::cast(holder)->SetElement(index, *value);
       USE(result);
       ASSERT(!result->IsFailure());
     }
@@ -3320,9 +3566,9 @@ static Object* Runtime_StoreContextSlot(Arguments args) {
   // It is either in an JSObject extension context or it was not found.
   Handle<JSObject> context_ext;
 
-  if (*context_obj != NULL) {
+  if (!holder.is_null()) {
     // The property exists in the extension context.
-    context_ext = Handle<JSObject>::cast(context_obj);
+    context_ext = Handle<JSObject>::cast(holder);
   } else {
     // The property was not found. It needs to be stored in the global context.
     ASSERT(attributes == ABSENT);
@@ -3393,10 +3639,10 @@ static Object* RuntimePreempt(Arguments args) {
 }
 
 
-static Object* Runtime_DebugBreak(Arguments args) {
+static Object* DebugBreakHelper() {
   // Just continue if breaks are disabled.
   if (Debug::disable_break()) {
-    return args[0];
+    return Heap::undefined_value();
   }
 
   // Don't break in system functions. If the current function is
@@ -3408,7 +3654,7 @@ static Object* Runtime_DebugBreak(Arguments args) {
   if (fun->IsJSFunction()) {
     GlobalObject* global = JSFunction::cast(fun)->context()->global();
     if (global->IsJSBuiltinsObject() || Debug::IsDebugGlobal(global)) {
-      return args[0];
+      return Heap::undefined_value();
     }
   }
 
@@ -3419,14 +3665,20 @@ static Object* Runtime_DebugBreak(Arguments args) {
   // Enter the debugger. Just continue if we fail to enter the debugger.
   EnterDebugger debugger;
   if (debugger.FailedToEnter()) {
-    return args[0];
+    return Heap::undefined_value();
   }
 
   // Notify the debug event listeners.
   Debugger::OnDebugBreak(Factory::undefined_value());
 
   // Return to continue execution.
-  return args[0];
+  return Heap::undefined_value();
+}
+
+
+static Object* Runtime_DebugBreak(Arguments args) {
+  ASSERT(args.length() == 0);
+  return DebugBreakHelper();
 }
 
 
@@ -3438,7 +3690,7 @@ static Object* Runtime_StackGuard(Arguments args) {
 
   // If not real stack overflow the stack guard was used to interrupt
   // execution for another purpose.
-  if (StackGuard::IsDebugBreak()) Runtime_DebugBreak(args);
+  if (StackGuard::IsDebugBreak()) DebugBreakHelper();
   if (StackGuard::IsPreempted()) RuntimePreempt(args);
   if (StackGuard::IsInterrupted()) {
     // interrupt
@@ -3536,9 +3788,10 @@ static void PrintTransition(Object* result) {
 
 
 static Object* Runtime_TraceEnter(Arguments args) {
+  ASSERT(args.length() == 0);
   NoHandleAllocation ha;
   PrintTransition(NULL);
-  return args[0];  // return TOS
+  return Heap::undefined_value();
 }
 
 
@@ -3577,10 +3830,10 @@ static Object* Runtime_DebugPrint(Arguments args) {
 
 
 static Object* Runtime_DebugTrace(Arguments args) {
-  ASSERT(args.length() == 1);
+  ASSERT(args.length() == 0);
   NoHandleAllocation ha;
   Top::PrintStack();
-  return args[0];  // return TOS
+  return Heap::undefined_value();
 }
 
 
@@ -3796,6 +4049,253 @@ static Object* Runtime_PushIfAbsent(Arguments args) {
 }
 
 
+/**
+ * A simple visitor visits every element of Array's.
+ * The backend storage can be a fixed array for fast elements case,
+ * or a dictionary for sparse array. Since Dictionary is a subtype
+ * of FixedArray, the class can be used by both fast and slow cases.
+ * The second parameter of the constructor, fast_elements, specifies
+ * whether the storage is a FixedArray or Dictionary.
+ *
+ * An index limit is used to deal with the situation that a result array
+ * length overflows 32-bit non-negative integer.
+ */
+class ArrayConcatVisitor {
+ public:
+  ArrayConcatVisitor(Handle<FixedArray> storage,
+                     uint32_t index_limit,
+                     bool fast_elements) :
+      storage_(storage), index_limit_(index_limit),
+      fast_elements_(fast_elements), index_offset_(0) { }
+
+  void visit(uint32_t i, Handle<Object> elm) {
+    uint32_t index = i + index_offset_;
+    if (index >= index_limit_) return;
+
+    if (fast_elements_) {
+      ASSERT(index < static_cast<uint32_t>(storage_->length()));
+      storage_->set(index, *elm);
+
+    } else {
+      Handle<Dictionary> dict = Handle<Dictionary>::cast(storage_);
+      Handle<Dictionary> result =
+          Factory::DictionaryAtNumberPut(dict, index, elm);
+      if (!result.is_identical_to(dict))
+        storage_ = result;
+    }
+  }
+
+  void increase_index_offset(uint32_t delta) {
+    index_offset_ += delta;
+  }
+
+ private:
+  Handle<FixedArray> storage_;
+  uint32_t index_limit_;
+  bool fast_elements_;
+  uint32_t index_offset_;
+};
+
+
+/**
+ * A helper function that visits elements of a JSObject. Only elements
+ * whose index between 0 and range (exclusive) are visited.
+ *
+ * If the third parameter, visitor, is not NULL, the visitor is called
+ * with parameters, 'visitor_index_offset + element index' and the element.
+ *
+ * It returns the number of visisted elements.
+ */
+static uint32_t IterateElements(Handle<JSObject> receiver,
+                                uint32_t range,
+                                ArrayConcatVisitor* visitor) {
+  uint32_t num_of_elements = 0;
+
+  if (receiver->HasFastElements()) {
+    Handle<FixedArray> elements(FixedArray::cast(receiver->elements()));
+    uint32_t len = elements->length();
+    if (range < len) len = range;
+
+    for (uint32_t j = 0; j < len; j++) {
+      Handle<Object> e(elements->get(j));
+      if (!e->IsTheHole()) {
+        num_of_elements++;
+        if (visitor)
+          visitor->visit(j, e);
+      }
+    }
+
+  } else {
+    Handle<Dictionary> dict(receiver->element_dictionary());
+    uint32_t capacity = dict->Capacity();
+    for (uint32_t j = 0; j < capacity; j++) {
+      Handle<Object> k(dict->KeyAt(j));
+      if (dict->IsKey(*k)) {
+        ASSERT(k->IsNumber());
+        uint32_t index = static_cast<uint32_t>(k->Number());
+        if (index < range) {
+          num_of_elements++;
+          if (visitor) {
+            visitor->visit(index,
+                           Handle<Object>(dict->ValueAt(j)));
+          }
+        }
+      }
+    }
+  }
+
+  return num_of_elements;
+}
+
+
+/**
+ * A helper function that visits elements of an Array object, and elements
+ * on its prototypes.
+ *
+ * Elements on prototypes are visited first, and only elements whose indices
+ * less than Array length are visited.
+ *
+ * If a ArrayConcatVisitor object is given, the visitor is called with
+ * parameters, element's index + visitor_index_offset and the element.
+ */
+static uint32_t IterateArrayAndPrototypeElements(Handle<JSArray> array,
+                                                 ArrayConcatVisitor* visitor) {
+  uint32_t range = static_cast<uint32_t>(array->length()->Number());
+  Handle<Object> obj = array;
+
+  static const int kEstimatedPrototypes = 3;
+  List< Handle<JSObject> > objects(kEstimatedPrototypes);
+
+  // Visit prototype first. If an element on the prototype is shadowed by
+  // the inheritor using the same index, the ArrayConcatVisitor visits
+  // the prototype element before the shadowing element.
+  // The visitor can simply overwrite the old value by new value using
+  // the same index.  This follows Array::concat semantics.
+  while (!obj->IsNull()) {
+    objects.Add(Handle<JSObject>::cast(obj));
+    obj = Handle<Object>(obj->GetPrototype());
+  }
+
+  uint32_t nof_elements = 0;
+  for (int i = objects.length() - 1; i >= 0; i--) {
+    Handle<JSObject> obj = objects[i];
+    nof_elements +=
+        IterateElements(Handle<JSObject>::cast(obj), range, visitor);
+  }
+
+  return nof_elements;
+}
+
+
+/**
+ * A helper function of Runtime_ArrayConcat.
+ *
+ * The first argument is an Array of arrays and objects. It is the
+ * same as the arguments array of Array::concat JS function.
+ *
+ * If an argument is an Array object, the function visits array
+ * elements.  If an argument is not an Array object, the function
+ * visits the object as if it is an one-element array.
+ *
+ * If the result array index overflows 32-bit integer, the rounded
+ * non-negative number is used as new length. For example, if one
+ * array length is 2^32 - 1, second array length is 1, the
+ * concatenated array length is 0.
+ */
+static uint32_t IterateArguments(Handle<JSArray> arguments,
+                                 ArrayConcatVisitor* visitor) {
+  uint32_t visited_elements = 0;
+  uint32_t num_of_args = static_cast<uint32_t>(arguments->length()->Number());
+
+  for (uint32_t i = 0; i < num_of_args; i++) {
+    Handle<Object> obj(arguments->GetElement(i));
+    if (obj->IsJSArray()) {
+      Handle<JSArray> array = Handle<JSArray>::cast(obj);
+      uint32_t len = static_cast<uint32_t>(array->length()->Number());
+      uint32_t nof_elements =
+          IterateArrayAndPrototypeElements(array, visitor);
+      // Total elements of array and its prototype chain can be more than
+      // the array length, but ArrayConcat can only concatenate at most
+      // the array length number of elements.
+      visited_elements += (nof_elements > len) ? len : nof_elements;
+      if (visitor) visitor->increase_index_offset(len);
+
+    } else {
+      if (visitor) {
+        visitor->visit(0, obj);
+        visitor->increase_index_offset(1);
+      }
+      visited_elements++;
+    }
+  }
+  return visited_elements;
+}
+
+
+/**
+ * Array::concat implementation.
+ * See ECMAScript 262, 15.4.4.4.
+ */
+static Object* Runtime_ArrayConcat(Arguments args) {
+  ASSERT(args.length() == 1);
+  HandleScope handle_scope;
+
+  CONVERT_CHECKED(JSArray, arg_arrays, args[0]);
+  Handle<JSArray> arguments(arg_arrays);
+
+  // Pass 1: estimate the number of elements of the result
+  // (it could be more than real numbers if prototype has elements).
+  uint32_t result_length = 0;
+  uint32_t num_of_args = static_cast<uint32_t>(arguments->length()->Number());
+
+  { AssertNoAllocation nogc;
+    for (uint32_t i = 0; i < num_of_args; i++) {
+      Object* obj = arguments->GetElement(i);
+      if (obj->IsJSArray()) {
+        result_length +=
+            static_cast<uint32_t>(JSArray::cast(obj)->length()->Number());
+      } else {
+        result_length++;
+      }
+    }
+  }
+
+  // Allocate an empty array, will set length and content later.
+  Handle<JSArray> result = Factory::NewJSArray(0);
+
+  uint32_t estimate_nof_elements = IterateArguments(arguments, NULL);
+  // If estimated number of elements is more than half of length, a
+  // fixed array (fast case) is more time and space-efficient than a
+  // dictionary.
+  bool fast_case = (estimate_nof_elements * 2) >= result_length;
+
+  Handle<FixedArray> storage;
+  if (fast_case) {
+    // The backing storage array must have non-existing elements to
+    // preserve holes across concat operations.
+    storage = Factory::NewFixedArrayWithHoles(result_length);
+
+  } else {
+    // TODO(126): move 25% pre-allocation logic into Dictionary::Allocate
+    uint32_t at_least_space_for = estimate_nof_elements +
+                                  (estimate_nof_elements >> 2);
+    storage = Handle<FixedArray>::cast(
+                  Factory::NewDictionary(at_least_space_for));
+  }
+
+  Handle<Object> len = Factory::NewNumber(static_cast<double>(result_length));
+
+  ArrayConcatVisitor visitor(storage, result_length, fast_case);
+
+  IterateArguments(arguments, &visitor);
+
+  result->set_length(*len);
+  result->set_elements(*storage);
+
+  return *result;
+}
+
+
 // This will not allocate (flatten the string), but it may run
 // very slowly for very deeply nested ConsStrings.  For debugging use only.
 static Object* Runtime_GlobalPrint(Arguments args) {
@@ -3872,7 +4372,9 @@ static Object* Runtime_GetArrayKeys(Arguments args) {
   } else {
     Handle<FixedArray> single_interval = Factory::NewFixedArray(2);
     // -1 means start of array.
-    single_interval->set(0, Smi::FromInt(-1));
+    single_interval->set(0,
+                         Smi::FromInt(-1),
+                         SKIP_WRITE_BARRIER);
     Handle<Object> length_object =
         Factory::NewNumber(static_cast<double>(length));
     single_interval->set(1, *length_object);
@@ -4303,7 +4805,7 @@ static Object* Runtime_GetFrameDetails(Arguments args) {
       Handle<String> name = info.LocalName(i);
       // Traverse the context chain to the function context as all local
       // variables stored in the context will be on the function context.
-      while (context->previous() != NULL) {
+      while (!context->is_function_context()) {
         context = Handle<Context>(context->previous());
       }
       ASSERT(context->is_function_context());
@@ -4719,12 +5221,13 @@ static Handle<Object> GetArgumentsObject(JavaScriptFrame* frame,
   }
 
   const int length = frame->GetProvidedParametersCount();
-  Handle<Object> arguments = Factory::NewArgumentsObject(function, length);
-  FixedArray* array = FixedArray::cast(JSObject::cast(*arguments)->elements());
-  ASSERT(array->length() == length);
+  Handle<JSObject> arguments = Factory::NewArgumentsObject(function, length);
+  Handle<FixedArray> array = Factory::NewFixedArray(length);
+  WriteBarrierMode mode = array->GetWriteBarrierMode();
   for (int i = 0; i < length; i++) {
-    array->set(i, frame->GetParameter(i));
+    array->set(i, frame->GetParameter(i), mode);
   }
+  arguments->set_elements(*array);
   return arguments;
 }
 
@@ -4819,7 +5322,7 @@ static Object* Runtime_DebugEvaluate(Arguments args) {
   }
   // Finally copy any properties from the function context extension. This will
   // be variables introduced by eval.
-  if (function_context->extension() != NULL &&
+  if (function_context->has_extension() &&
       !function_context->IsGlobalContext()) {
     Handle<JSObject> ext(JSObject::cast(function_context->extension()));
     Handle<FixedArray> keys = GetKeysInFixedArrayFor(ext);
@@ -5331,9 +5834,16 @@ Runtime::Function* Runtime::FunctionForName(const char* name) {
 
 void Runtime::PerformGC(Object* result) {
   Failure* failure = Failure::cast(result);
-  // Try to do a garbage collection; ignore it if it fails. The C
-  // entry stub will throw an out-of-memory exception in that case.
-  Heap::CollectGarbage(failure->requested(), failure->allocation_space());
+  if (failure->IsRetryAfterGC()) {
+    // Try to do a garbage collection; ignore it if it fails. The C
+    // entry stub will throw an out-of-memory exception in that case.
+    Heap::CollectGarbage(failure->requested(), failure->allocation_space());
+  } else {
+    // Handle last resort GC and make sure to allow future allocations
+    // to grow the heap without causing GCs (if possible).
+    Counters::gc_last_resort_from_js.Increment();
+    Heap::CollectAllGarbage();
+  }
 }
 
 

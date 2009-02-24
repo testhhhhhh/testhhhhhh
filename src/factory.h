@@ -37,10 +37,15 @@ namespace v8 { namespace internal {
 
 class Factory : public AllStatic {
  public:
-  // Allocate a new fixed array.
+  // Allocate a new fixed array with undefined entries.
   static Handle<FixedArray> NewFixedArray(
       int size,
       PretenureFlag pretenure = NOT_TENURED);
+
+  // Allocate a new fixed array with non-existing entries (the hole).
+  static Handle<FixedArray> NewFixedArrayWithHoles(int size);
+
+  static Handle<Dictionary> NewDictionary(int at_least_space_for);
 
   static Handle<DescriptorArray> NewDescriptorArray(int number_of_descriptors);
 
@@ -300,6 +305,14 @@ class Factory : public AllStatic {
   // The key the an ordered set of property names.
   static Handle<Map> ObjectLiteralMapFromCache(Handle<Context> context,
                                                Handle<FixedArray> keys);
+
+  // Creates a new FixedArray that holds the data associated with the
+  // regexp and stores it in the regexp.
+  static void SetRegExpData(Handle<JSRegExp> regexp,
+                            JSRegExp::Type type,
+                            Handle<String> source,
+                            JSRegExp::Flags flags,
+                            Handle<Object> data);
 
  private:
   static Handle<JSFunction> NewFunctionHelper(Handle<String> name,

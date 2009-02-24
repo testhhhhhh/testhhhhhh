@@ -66,10 +66,11 @@ Smi* PropertyDetails::AsSmi() {
 
 #define ACCESSORS(holder, name, type, offset)                           \
   type* holder::name() { return type::cast(READ_FIELD(this, offset)); } \
-  void holder::set_##name(type* value) {                                \
+  void holder::set_##name(type* value, WriteBarrierMode mode) {         \
     WRITE_FIELD(this, offset, value);                                   \
-    WRITE_BARRIER(this, offset);                                        \
+    CONDITIONAL_WRITE_BARRIER(this, offset, mode);                      \
   }
+
 
 
 #define SMI_ACCESSORS(holder, name, offset)             \
@@ -122,6 +123,12 @@ bool Object::IsSeqString() {
 bool Object::IsSeqAsciiString() {
   return IsSeqString()
       && String::cast(this)->IsAsciiRepresentation();
+}
+
+
+bool String::IsSeqAsciiString() {
+  return (this->representation_tag() == kSeqStringTag)
+    && is_ascii_representation();
 }
 
 
@@ -294,6 +301,11 @@ bool Object::IsJSValue() {
 }
 
 
+bool Object::IsStringWrapper() {
+  return IsJSValue() && JSValue::cast(this)->value()->IsString();
+}
+
+
 bool Object::IsProxy() {
   return Object::IsHeapObject()
     && HeapObject::cast(this)->map()->instance_type() == PROXY_TYPE;
@@ -348,17 +360,22 @@ bool Object::IsMapCache() {
 }
 
 
+bool Object::IsLookupCache() {
+  return IsHashTable();
+}
+
+
 bool Object::IsPrimitive() {
   return IsOddball() || IsNumber() || IsString();
 }
 
 
 bool Object::IsGlobalObject() {
-  return IsHeapObject() &&
-      ((HeapObject::cast(this)->map()->instance_type() ==
-        JS_GLOBAL_OBJECT_TYPE) ||
-       (HeapObject::cast(this)->map()->instance_type() ==
-        JS_BUILTINS_OBJECT_TYPE));
+  if (!IsHeapObject()) return false;
+
+  InstanceType type = HeapObject::cast(this)->map()->instance_type();
+  return type == JS_GLOBAL_OBJECT_TYPE ||
+         type == JS_BUILTINS_OBJECT_TYPE;
 }
 
 
@@ -391,7 +408,7 @@ bool Object::IsUndetectableObject() {
 
 bool Object::IsAccessCheckNeeded() {
   return IsHeapObject()
-    && HeapObject::cast(this)->map()->needs_access_check();
+    && HeapObject::cast(this)->map()->is_access_check_needed();
 }
 
 
@@ -487,8 +504,20 @@ Object* Object::GetProperty(String* key, PropertyAttributes* attributes) {
 #define WRITE_FIELD(p, offset, value) \
   (*reinterpret_cast<Object**>(FIELD_ADDR(p, offset)) = value)
 
+
 #define WRITE_BARRIER(object, offset) \
   Heap::RecordWrite(object->address(), offset);
+
+// CONDITIONAL_WRITE_BARRIER must be issued after the actual
+// write due to the assert validating the written value.
+#define CONDITIONAL_WRITE_BARRIER(object, offset, mode) \
+  if (mode == UPDATE_WRITE_BARRIER) { \
+    Heap::RecordWrite(object->address(), offset); \
+  } else { \
+    ASSERT(mode == SKIP_WRITE_BARRIER); \
+    ASSERT(Heap::InNewSpace(object) || \
+           !Heap::InNewSpace(READ_FIELD(object, offset))); \
+  }
 
 #define READ_DOUBLE_FIELD(p, offset) \
   (*reinterpret_cast<double*>(FIELD_ADDR(p, offset)))
@@ -521,8 +550,8 @@ Object* Object::GetProperty(String* key, PropertyAttributes* attributes) {
   (*reinterpret_cast<byte*>(FIELD_ADDR(p, offset)) = value)
 
 
-Object* HeapObject::GetHeapObjectField(HeapObject* obj, int index) {
-  return READ_FIELD(obj, HeapObject::kHeaderSize + kPointerSize * index);
+Object** HeapObject::RawField(HeapObject* obj, int byte_offset) {
+  return &READ_FIELD(obj, byte_offset);
 }
 
 
@@ -584,6 +613,17 @@ Failure* Failure::OutOfMemoryException() {
 
 int Failure::value() const {
   return reinterpret_cast<int>(this) >> kFailureTagSize;
+}
+
+
+Failure* Failure::RetryAfterGC(int requested_bytes) {
+  int requested = requested_bytes >> kObjectAlignmentBits;
+  int value = (requested << kSpaceTagSize) | NEW_SPACE;
+  ASSERT(value >> kSpaceTagSize == requested);
+  ASSERT(Smi::IsValid(value));
+  ASSERT(value == ((value << kFailureTypeTagSize) >> kFailureTypeTagSize));
+  ASSERT(Smi::IsValid(value << kFailureTypeTagSize));
+  return Construct(RETRY_AFTER_GC, value);
 }
 
 
@@ -783,21 +823,6 @@ void HeapObject::IteratePointer(ObjectVisitor* v, int offset) {
 }
 
 
-void HeapObject::CopyBody(JSObject* from) {
-  ASSERT(map() == from->map());
-  ASSERT(Size() == from->Size());
-  int object_size = Size();
-  for (int offset = kHeaderSize;
-       offset < object_size;
-       offset += kPointerSize) {
-    Object* value = READ_FIELD(from, offset);
-    // Note: WRITE_FIELD does not update the write barrier.
-    WRITE_FIELD(this, offset, value);
-    WRITE_BARRIER(this, offset);
-  }
-}
-
-
 bool HeapObject::IsMarked() {
   return map_word().IsMarked();
 }
@@ -924,7 +949,7 @@ void JSObject::SetInternalField(int index, Object* value) {
 // Access fast-case object properties at index. The use of these routines
 // is needed to correctly distinguish between properties stored in-object and
 // properties stored in the properties array.
-inline Object* JSObject::FastPropertyAt(int index) {
+Object* JSObject::FastPropertyAt(int index) {
   // Adjust for the number of properties stored in the object.
   index -= map()->inobject_properties();
   if (index < 0) {
@@ -937,7 +962,7 @@ inline Object* JSObject::FastPropertyAt(int index) {
 }
 
 
-inline Object* JSObject::FastPropertyAtPut(int index, Object* value) {
+Object* JSObject::FastPropertyAtPut(int index, Object* value) {
   // Adjust for the number of properties stored in the object.
   index -= map()->inobject_properties();
   if (index < 0) {
@@ -952,16 +977,32 @@ inline Object* JSObject::FastPropertyAtPut(int index, Object* value) {
 }
 
 
+Object* JSObject::InObjectPropertyAtPut(int index,
+                                        Object* value,
+                                        WriteBarrierMode mode) {
+  // Adjust for the number of properties stored in the object.
+  index -= map()->inobject_properties();
+  ASSERT(index < 0);
+  int offset = map()->instance_size() + (index * kPointerSize);
+  WRITE_FIELD(this, offset, value);
+  CONDITIONAL_WRITE_BARRIER(this, offset, mode);
+  return value;
+}
+
+
+
 void JSObject::InitializeBody(int object_size) {
+  Object* value = Heap::undefined_value();
   for (int offset = kHeaderSize; offset < object_size; offset += kPointerSize) {
-    WRITE_FIELD(this, offset, Heap::undefined_value());
+    WRITE_FIELD(this, offset, value);
   }
 }
 
 
 void Struct::InitializeBody(int object_size) {
+  Object* value = Heap::undefined_value();
   for (int offset = kHeaderSize; offset < object_size; offset += kPointerSize) {
-    WRITE_FIELD(this, offset, Heap::undefined_value());
+    WRITE_FIELD(this, offset, value);
   }
 }
 
@@ -1017,7 +1058,7 @@ void FixedArray::set(int index, Object* value) {
 }
 
 
-FixedArray::WriteBarrierMode FixedArray::GetWriteBarrierMode() {
+WriteBarrierMode HeapObject::GetWriteBarrierMode() {
   if (Heap::InNewSpace(this)) return SKIP_WRITE_BARRIER;
   return UPDATE_WRITE_BARRIER;
 }
@@ -1025,16 +1066,11 @@ FixedArray::WriteBarrierMode FixedArray::GetWriteBarrierMode() {
 
 void FixedArray::set(int index,
                      Object* value,
-                     FixedArray::WriteBarrierMode mode) {
+                     WriteBarrierMode mode) {
   ASSERT(index >= 0 && index < this->length());
   int offset = kHeaderSize + index * kPointerSize;
   WRITE_FIELD(this, offset, value);
-  if (mode == UPDATE_WRITE_BARRIER) {
-    WRITE_BARRIER(this, offset);
-  } else {
-    ASSERT(mode == SKIP_WRITE_BARRIER);
-    ASSERT(Heap::InNewSpace(this) || !Heap::InNewSpace(value));
-  }
+  CONDITIONAL_WRITE_BARRIER(this, offset, mode);
 }
 
 
@@ -1090,10 +1126,7 @@ int DescriptorArray::Search(String* name) {
   // Fast case: do linear search for small arrays.
   const int kMaxElementsForLinearSearch = 8;
   if (name->IsSymbol() && nof < kMaxElementsForLinearSearch) {
-    for (int number = 0; number < nof; number++) {
-      if (name == GetKey(number)) return number;
-    }
-    return kNotFound;
+    return LinearSearch(name, nof);
   }
 
   // Slow case: perform binary search.
@@ -1152,7 +1185,7 @@ void DescriptorArray::Swap(int first, int second) {
 
 
 bool Dictionary::requires_slow_elements() {
-  Object* max_index_object = get(kPrefixStartIndex);
+  Object* max_index_object = get(kMaxNumberKeyIndex);
   if (!max_index_object->IsSmi()) return false;
   return 0 !=
       (Smi::cast(max_index_object)->value() & kRequiresSlowElementsMask);
@@ -1161,7 +1194,7 @@ bool Dictionary::requires_slow_elements() {
 
 uint32_t Dictionary::max_number_key() {
   ASSERT(!requires_slow_elements());
-  Object* max_index_object = get(kPrefixStartIndex);
+  Object* max_index_object = get(kMaxNumberKeyIndex);
   if (!max_index_object->IsSmi()) return 0;
   uint32_t value = static_cast<uint32_t>(Smi::cast(max_index_object)->value());
   return value >> kRequiresSlowElementsTagSize;
@@ -1178,6 +1211,7 @@ CAST_ACCESSOR(Dictionary)
 CAST_ACCESSOR(SymbolTable)
 CAST_ACCESSOR(CompilationCacheTable)
 CAST_ACCESSOR(MapCache)
+CAST_ACCESSOR(LookupCache)
 CAST_ACCESSOR(String)
 CAST_ACCESSOR(SeqString)
 CAST_ACCESSOR(SeqAsciiString)
@@ -1196,6 +1230,7 @@ CAST_ACCESSOR(Oddball)
 CAST_ACCESSOR(SharedFunctionInfo)
 CAST_ACCESSOR(Map)
 CAST_ACCESSOR(JSFunction)
+CAST_ACCESSOR(GlobalObject)
 CAST_ACCESSOR(JSGlobalObject)
 CAST_ACCESSOR(JSBuiltinsObject)
 CAST_ACCESSOR(Code)
@@ -1231,36 +1266,22 @@ bool String::Equals(String* other) {
 int String::length() {
   uint32_t len = READ_INT_FIELD(this, kLengthOffset);
 
-  switch (size_tag()) {
-    case kShortStringTag:
-      return  len >> kShortLengthShift;
-    case kMediumStringTag:
-      return len >> kMediumLengthShift;
-    case kLongStringTag:
-      return len >> kLongLengthShift;
-    default:
-      break;
-  }
-  UNREACHABLE();
-  return 0;
+  ASSERT(kShortStringTag + kLongLengthShift == kShortLengthShift);
+  ASSERT(kMediumStringTag + kLongLengthShift == kMediumLengthShift);
+  ASSERT(kLongStringTag == 0);
+
+  return len >> (size_tag() + kLongLengthShift);
 }
 
 
 void String::set_length(int value) {
-  switch (size_tag()) {
-    case kShortStringTag:
-      WRITE_INT_FIELD(this, kLengthOffset, value << kShortLengthShift);
-      break;
-    case kMediumStringTag:
-      WRITE_INT_FIELD(this, kLengthOffset, value << kMediumLengthShift);
-      break;
-    case kLongStringTag:
-      WRITE_INT_FIELD(this, kLengthOffset, value << kLongLengthShift);
-      break;
-    default:
-      UNREACHABLE();
-      break;
-  }
+  ASSERT(kShortStringTag + kLongLengthShift == kShortLengthShift);
+  ASSERT(kMediumStringTag + kLongLengthShift == kMediumLengthShift);
+  ASSERT(kLongStringTag == 0);
+
+  WRITE_INT_FIELD(this,
+                  kLengthOffset,
+                  value << (size_tag() + kLongLengthShift));
 }
 
 
@@ -1363,6 +1384,12 @@ bool String::is_ascii_representation_map(Map* map) {
 }
 
 
+int String::full_representation_tag() {
+  return map()->instance_type() &
+         (kStringRepresentationMask | kStringEncodingMask);
+}
+
+
 StringRepresentationTag String::representation_tag() {
   return map_representation_tag(map());
 }
@@ -1408,8 +1435,18 @@ Address SeqAsciiString::GetCharsAddress() {
 }
 
 
+char* SeqAsciiString::GetChars() {
+  return reinterpret_cast<char*>(GetCharsAddress());
+}
+
+
 Address SeqTwoByteString::GetCharsAddress() {
   return FIELD_ADDR(this, kHeaderSize);
+}
+
+
+uc16* SeqTwoByteString::GetChars() {
+  return reinterpret_cast<uc16*>(FIELD_ADDR(this, kHeaderSize));
 }
 
 
@@ -1428,21 +1465,14 @@ void SeqTwoByteString::SeqTwoByteStringSet(int index, uint16_t value) {
 int SeqTwoByteString::SeqTwoByteStringSize(Map* map) {
   uint32_t length = READ_INT_FIELD(this, kLengthOffset);
 
+  ASSERT(kShortStringTag + kLongLengthShift == kShortLengthShift);
+  ASSERT(kMediumStringTag + kLongLengthShift == kMediumLengthShift);
+  ASSERT(kLongStringTag == 0);
+
   // Use the map (and not 'this') to compute the size tag, since
   // TwoByteStringSize is called during GC when maps are encoded.
-  switch (map_size_tag(map)) {
-    case kShortStringTag:
-      length = length >> kShortLengthShift;
-      break;
-    case kMediumStringTag:
-      length = length >> kMediumLengthShift;
-      break;
-    case kLongStringTag:
-      length = length >> kLongLengthShift;
-      break;
-    default:
-      break;
-  }
+  length >>= map_size_tag(map) + kLongLengthShift;
+
   return SizeFor(length);
 }
 
@@ -1450,21 +1480,13 @@ int SeqTwoByteString::SeqTwoByteStringSize(Map* map) {
 int SeqAsciiString::SeqAsciiStringSize(Map* map) {
   uint32_t length = READ_INT_FIELD(this, kLengthOffset);
 
+  ASSERT(kShortStringTag + kLongLengthShift == kShortLengthShift);
+  ASSERT(kMediumStringTag + kLongLengthShift == kMediumLengthShift);
+  ASSERT(kLongStringTag == 0);
+
   // Use the map (and not 'this') to compute the size tag, since
   // AsciiStringSize is called during GC when maps are encoded.
-  switch (map_size_tag(map)) {
-    case kShortStringTag:
-      length = length >> kShortLengthShift;
-      break;
-    case kMediumStringTag:
-      length = length >> kMediumLengthShift;
-      break;
-    case kLongStringTag:
-      length = length >> kLongLengthShift;
-      break;
-    default:
-      break;
-  }
+  length >>= map_size_tag(map) + kLongLengthShift;
 
   return SizeFor(length);
 }
@@ -1475,9 +1497,9 @@ Object* ConsString::first() {
 }
 
 
-void ConsString::set_first(Object* value) {
+void ConsString::set_first(Object* value, WriteBarrierMode mode) {
   WRITE_FIELD(this, kFirstOffset, value);
-  WRITE_BARRIER(this, kFirstOffset);
+  CONDITIONAL_WRITE_BARRIER(this, kFirstOffset, mode);
 }
 
 
@@ -1486,9 +1508,9 @@ Object* ConsString::second() {
 }
 
 
-void ConsString::set_second(Object* value) {
+void ConsString::set_second(Object* value, WriteBarrierMode mode) {
   WRITE_FIELD(this, kSecondOffset, value);
-  WRITE_BARRIER(this, kSecondOffset);
+  CONDITIONAL_WRITE_BARRIER(this, kSecondOffset, mode);
 }
 
 
@@ -1645,6 +1667,20 @@ bool Map::has_non_instance_prototype() {
 }
 
 
+void Map::set_is_access_check_needed(bool access_check_needed) {
+  if (access_check_needed) {
+    set_bit_field(bit_field() | (1 << kIsAccessCheckNeeded));
+  } else {
+    set_bit_field(bit_field() & ~(1 << kIsAccessCheckNeeded));
+  }
+}
+
+
+bool Map::is_access_check_needed() {
+  return ((1 << kIsAccessCheckNeeded) & bit_field()) != 0;
+}
+
+
 Code::Flags Code::flags() {
   return static_cast<Flags>(READ_INT_FIELD(this, kFlagsOffset));
 }
@@ -1768,10 +1804,10 @@ Object* Map::prototype() {
 }
 
 
-void Map::set_prototype(Object* value) {
+void Map::set_prototype(Object* value, WriteBarrierMode mode) {
   ASSERT(value->IsNull() || value->IsJSObject());
   WRITE_FIELD(this, kPrototypeOffset, value);
-  WRITE_BARRIER(this, kPrototypeOffset);
+  CONDITIONAL_WRITE_BARRIER(this, kPrototypeOffset, mode);
 }
 
 
@@ -1911,9 +1947,9 @@ Code* SharedFunctionInfo::code() {
 }
 
 
-void SharedFunctionInfo::set_code(Code* value) {
+void SharedFunctionInfo::set_code(Code* value, WriteBarrierMode mode) {
   WRITE_FIELD(this, kCodeOffset, value);
-  WRITE_BARRIER(this, kCodeOffset);
+  CONDITIONAL_WRITE_BARRIER(this, kCodeOffset, mode);
 }
 
 
@@ -2011,6 +2047,11 @@ bool JSFunction::is_compiled() {
 }
 
 
+int JSFunction::NumberOfLiterals() {
+  return literals()->length();
+}
+
+
 Object* JSBuiltinsObject::javascript_builtin(Builtins::JavaScript id) {
   ASSERT(0 <= id && id < kJSBuiltinsCount);
   return READ_FIELD(this, kJSBuiltinsOffset + (id * kPointerSize));
@@ -2101,16 +2142,19 @@ ACCESSORS(JSArray, length, Object, kLengthOffset)
 
 
 ACCESSORS(JSRegExp, data, Object, kDataOffset)
-ACCESSORS(JSRegExp, type, Object, kTypeOffset)
 
 
-JSRegExp::Type JSRegExp::type_tag() {
-  return static_cast<JSRegExp::Type>(Smi::cast(type())->value());
+JSRegExp::Type JSRegExp::TypeTag() {
+  Object* data = this->data();
+  if (data->IsUndefined()) return JSRegExp::NOT_COMPILED;
+  Smi* smi = Smi::cast(FixedArray::cast(data)->get(kTagIndex));
+  return static_cast<JSRegExp::Type>(smi->value());
 }
 
 
-void JSRegExp::set_type_tag(JSRegExp::Type value) {
-  set_type(Smi::FromInt(value));
+Object* JSRegExp::DataAt(int index) {
+  ASSERT(TypeTag() != NOT_COMPILED);
+  return FixedArray::cast(data())->get(index);
 }
 
 
@@ -2150,7 +2194,7 @@ uint32_t String::Hash() {
   // Fast case: has hash code already been computed?
   uint32_t field = length_field();
   if (field & kHashComputedMask) return field >> kHashShift;
-  // Slow case: compute hash code and set it..
+  // Slow case: compute hash code and set it.
   return ComputeAndSetHash();
 }
 
@@ -2170,11 +2214,12 @@ bool StringHasher::has_trivial_hash() {
 
 
 void StringHasher::AddCharacter(uc32 c) {
-  // Note: the Jenkins one-at-a-time hash function
+  // Use the Jenkins one-at-a-time hash function to update the hash
+  // for the given character.
   raw_running_hash_ += c;
   raw_running_hash_ += (raw_running_hash_ << 10);
   raw_running_hash_ ^= (raw_running_hash_ >> 6);
-  // Incremental array index computation
+  // Incremental array index computation.
   if (is_array_index_) {
     if (c < '0' || c > '9') {
       is_array_index_ = false;
@@ -2256,6 +2301,16 @@ void AccessorInfo::set_all_can_write(bool value) {
 }
 
 
+bool AccessorInfo::prohibits_overwriting() {
+  return BooleanBit::get(flag(), kProhibitsOverwritingBit);
+}
+
+
+void AccessorInfo::set_prohibits_overwriting(bool value) {
+  set_flag(BooleanBit::set(flag(), kProhibitsOverwritingBit, value));
+}
+
+
 PropertyAttributes AccessorInfo::property_attributes() {
   return AttributesField::decode(static_cast<uint32_t>(flag()->value()));
 }
@@ -2290,8 +2345,14 @@ void Map::ClearCodeCache() {
 
 
 void JSArray::SetContent(FixedArray* storage) {
-  set_length(Smi::FromInt(storage->length()));
+  set_length(Smi::FromInt(storage->length()), SKIP_WRITE_BARRIER);
   set_elements(storage);
+}
+
+
+Object* FixedArray::Copy() {
+  if (length() == 0) return this;
+  return Heap::CopyFixedArray(this);
 }
 
 
@@ -2303,6 +2364,7 @@ void JSArray::SetContent(FixedArray* storage) {
 #undef READ_FIELD
 #undef WRITE_FIELD
 #undef WRITE_BARRIER
+#undef CONDITIONAL_WRITE_BARRIER
 #undef READ_MEMADDR_FIELD
 #undef WRITE_MEMADDR_FIELD
 #undef READ_DOUBLE_FIELD

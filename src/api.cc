@@ -230,7 +230,13 @@ void V8::SetFlagsFromCommandLine(int* argc, char** argv, bool remove_flags) {
 
 v8::Handle<Value> ThrowException(v8::Handle<v8::Value> value) {
   if (IsDeadCheck("v8::ThrowException()")) return v8::Handle<Value>();
-  i::Top::ScheduleThrow(*Utils::OpenHandle(*value));
+  // If we're passed an empty handle, we throw an undefined exception
+  // to deal more gracefully with out of memory situations.
+  if (value.IsEmpty()) {
+    i::Top::ScheduleThrow(i::Heap::undefined_value());
+  } else {
+    i::Top::ScheduleThrow(*Utils::OpenHandle(*value));
+  }
   return v8::Undefined();
 }
 
@@ -705,6 +711,7 @@ void FunctionTemplate::AddInstancePropertyAccessor(
   obj->set_name(*Utils::OpenHandle(*name));
   if (settings & ALL_CAN_READ) obj->set_all_can_read(true);
   if (settings & ALL_CAN_WRITE) obj->set_all_can_write(true);
+  if (settings & PROHIBITS_OVERWRITING) obj->set_prohibits_overwriting(true);
   obj->set_property_attributes(static_cast<PropertyAttributes>(attributes));
 
   i::Handle<i::Object> list(Utils::OpenHandle(this)->property_accessors());
@@ -2216,7 +2223,7 @@ bool v8::V8::Initialize() {
 
 
 const char* v8::V8::GetVersion() {
-  return "0.3.5.2";
+  return "0.3.9.4";
 }
 
 
@@ -2623,6 +2630,11 @@ void V8::SetGlobalGCEpilogueCallback(GCCallback callback) {
 
 String::Utf8Value::Utf8Value(v8::Handle<v8::Value> obj) {
   EnsureInitialized("v8::String::Utf8Value::Utf8Value()");
+  if (obj.IsEmpty()) {
+    str_ = NULL;
+    length_ = 0;
+    return;
+  }
   HandleScope scope;
   TryCatch try_catch;
   Handle<String> str = obj->ToString();
@@ -2644,6 +2656,11 @@ String::Utf8Value::~Utf8Value() {
 
 String::AsciiValue::AsciiValue(v8::Handle<v8::Value> obj) {
   EnsureInitialized("v8::String::AsciiValue::AsciiValue()");
+  if (obj.IsEmpty()) {
+    str_ = NULL;
+    length_ = 0;
+    return;
+  }
   HandleScope scope;
   TryCatch try_catch;
   Handle<String> str = obj->ToString();
@@ -2665,6 +2682,11 @@ String::AsciiValue::~AsciiValue() {
 
 String::Value::Value(v8::Handle<v8::Value> obj) {
   EnsureInitialized("v8::String::Value::Value()");
+  if (obj.IsEmpty()) {
+    str_ = NULL;
+    length_ = 0;
+    return;
+  }
   HandleScope scope;
   TryCatch try_catch;
   Handle<String> str = obj->ToString();
@@ -2758,8 +2780,8 @@ Local<Value> Exception::Error(v8::Handle<v8::String> raw_message) {
 
 
 bool Debug::AddDebugEventListener(DebugEventCallback that, Handle<Value> data) {
-  EnsureInitialized("v8::V8::AddDebugEventListener()");
-  ON_BAILOUT("v8::V8::AddDebugEventListener()", return false);
+  EnsureInitialized("v8::Debug::AddDebugEventListener()");
+  ON_BAILOUT("v8::Debug::AddDebugEventListener()", return false);
   HandleScope scope;
   NeanderArray listeners(i::Factory::debug_event_listeners());
   NeanderObject obj(2);
@@ -2775,7 +2797,7 @@ bool Debug::AddDebugEventListener(DebugEventCallback that, Handle<Value> data) {
 
 bool Debug::AddDebugEventListener(v8::Handle<v8::Function> that,
                                   Handle<Value> data) {
-  ON_BAILOUT("v8::V8::AddDebugEventListener()", return false);
+  ON_BAILOUT("v8::Debug::AddDebugEventListener()", return false);
   HandleScope scope;
   NeanderArray listeners(i::Factory::debug_event_listeners());
   NeanderObject obj(2);
@@ -2790,8 +2812,8 @@ bool Debug::AddDebugEventListener(v8::Handle<v8::Function> that,
 
 
 void Debug::RemoveDebugEventListener(DebugEventCallback that) {
-  EnsureInitialized("v8::V8::RemoveDebugEventListener()");
-  ON_BAILOUT("v8::V8::RemoveDebugEventListener()", return);
+  EnsureInitialized("v8::Debug::RemoveDebugEventListener()");
+  ON_BAILOUT("v8::Debug::RemoveDebugEventListener()", return);
   HandleScope scope;
   NeanderArray listeners(i::Factory::debug_event_listeners());
   for (int i = 0; i < listeners.length(); i++) {
@@ -2811,7 +2833,7 @@ void Debug::RemoveDebugEventListener(DebugEventCallback that) {
 
 
 void Debug::RemoveDebugEventListener(v8::Handle<v8::Function> that) {
-  ON_BAILOUT("v8::V8::RemoveDebugEventListener()", return);
+  ON_BAILOUT("v8::Debug::RemoveDebugEventListener()", return);
   HandleScope scope;
   NeanderArray listeners(i::Factory::debug_event_listeners());
   for (int i = 0; i < listeners.length(); i++) {
@@ -2833,16 +2855,19 @@ void Debug::RemoveDebugEventListener(v8::Handle<v8::Function> that) {
 
 
 void Debug::DebugBreak() {
+  if (!i::V8::HasBeenSetup()) return;
   i::StackGuard::DebugBreak();
 }
 
 
 void Debug::SetMessageHandler(v8::DebugMessageHandler handler, void* data) {
+  EnsureInitialized("v8::Debug::SetMessageHandler");
   i::Debugger::SetMessageHandler(handler, data);
 }
 
 
 void Debug::SendCommand(const uint16_t* command, int length) {
+  if (!i::V8::HasBeenSetup()) return;
   i::Debugger::ProcessCommand(i::Vector<const uint16_t>(command, length));
 }
 
